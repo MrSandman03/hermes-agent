@@ -208,11 +208,13 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
+        "auto_deliver_media",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 auto_deliver_media=False):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -231,15 +233,19 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        # Trusted producer contract: the gateway may recover MEDIA directives
+        # from this tool's current-turn result when the model omits them.
+        self.auto_deliver_media = bool(auto_deliver_media)
 
 
 class _PluginOverridePolicy:
-    """Identity-bearing authorization record for one plugin generation."""
+    """Identity-bearing tool authorization record for one plugin generation."""
 
-    __slots__ = ("allowed",)
+    __slots__ = ("allowed", "media_delivery_allowed")
 
-    def __init__(self, allowed: bool) -> None:
+    def __init__(self, allowed: bool, *, media_delivery_allowed: bool = False) -> None:
         self.allowed = bool(allowed)
+        self.media_delivery_allowed = bool(media_delivery_allowed)
 
 
 # ---------------------------------------------------------------------------
@@ -600,6 +606,7 @@ class ToolRegistry:
         module_namespace: str,
         allowed: bool,
         *,
+        media_delivery_allowed: bool = False,
         scope: Optional[str] = None,
     ) -> _PluginOverridePolicy:
         """Bind a plugin module namespace to its current operator opt-in.
@@ -608,7 +615,10 @@ class ToolRegistry:
         authorization without losing durable module-to-profile attribution.
         """
         with self._lock:
-            policy = _PluginOverridePolicy(allowed)
+            policy = _PluginOverridePolicy(
+                allowed,
+                media_delivery_allowed=media_delivery_allowed,
+            )
             self._plugin_override_policy[(scope, module_namespace)] = policy
             self._plugin_module_scopes.setdefault(module_namespace, set()).add(scope)
             return policy
@@ -651,6 +661,16 @@ class ToolRegistry:
         if policy is None and scope is not None:
             policy = self._plugin_override_policy.get((None, module_namespace))
         return bool(policy and policy.allowed)
+
+    def _plugin_media_delivery_allowed(
+        self,
+        scope: Optional[str],
+        module_namespace: str,
+    ) -> bool:
+        policy = self._plugin_override_policy.get((scope, module_namespace))
+        if policy is None and scope is not None:
+            policy = self._plugin_override_policy.get((None, module_namespace))
+        return bool(policy and policy.media_delivery_allowed)
 
     def _plugin_owner_of(self, handler: Callable) -> Optional[str]:
         """Return the plugin module namespace that defined *handler*, or None
@@ -773,6 +793,7 @@ class ToolRegistry:
         emoji: str = "",
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
+        auto_deliver_media: bool = False,
         override: bool = False,
         scope: Optional[str] = None,
     ):
@@ -790,6 +811,15 @@ class ToolRegistry:
         if scope is None and owner is not None:
             scope = self._plugin_scope_of(owner)
         with self._lock:
+            if (
+                auto_deliver_media
+                and owner is not None
+                and not self._plugin_media_delivery_allowed(scope, owner)
+            ):
+                raise PermissionError(
+                    f"Plugin module {owner!r} cannot register a trusted media "
+                    "producer without gateway.media_delivery consent."
+                )
             target = (
                 self._tools
                 if scope is None
@@ -870,6 +900,7 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                auto_deliver_media=auto_deliver_media,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by

@@ -51,6 +51,7 @@ class TestRegistry:
     def test_known_ids(self):
         assert "tools.override" in VALID_CAPABILITY_IDS
         assert "llm.model_override" in VALID_CAPABILITY_IDS
+        assert "gateway.media_delivery" in VALID_CAPABILITY_IDS
 
 
 # ── Declaration parsing ──────────────────────────────────────────────────────
@@ -346,6 +347,44 @@ class TestLegacyGateCompat:
         manifest = PluginManifest(name="oldplug", source="user", key="oldplug")
         ctx = PluginContext(manifest, PluginManager())
         assert ctx._tool_override_allowed("write_file") is True
+
+    def test_plugin_media_producer_registration_requires_explicit_grant(
+        self, hermes_home
+    ):
+        from hermes_cli.plugins import PluginContext, PluginManifest, PluginManager
+        from tools.registry import registry
+
+        manifest = PluginManifest(name="capplug", source="user", key="capplug")
+        manager = PluginManager()
+        ctx = PluginContext(manifest, manager)
+        kwargs = {
+            "name": "capplug_render_package",
+            "toolset": "capplug",
+            "schema": {
+                "name": "capplug_render_package",
+                "description": "Render one package.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            "handler": lambda _args: "MEDIA:/tmp/package.pdf",
+            "auto_deliver_media": True,
+        }
+
+        with pytest.raises(PermissionError, match="gateway.media_delivery"):
+            ctx.register_tool(**kwargs)
+
+        record_consent(
+            "capplug", ["gateway.media_delivery"], ["gateway.media_delivery"]
+        )
+        handle = ctx.register_tool(**kwargs)
+        assert handle is not None
+        try:
+            entry = registry.get_entry(
+                "capplug_render_package", scope=manager.scope_key
+            )
+            assert entry is not None
+            assert entry.auto_deliver_media is True
+        finally:
+            handle.dispose()
 
     def test_bundled_plugin_trusted(self, hermes_home):
         from hermes_cli.plugins import PluginContext, PluginManifest, PluginManager

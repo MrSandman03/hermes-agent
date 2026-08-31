@@ -2008,6 +2008,19 @@ _AUTO_APPEND_MEDIA_TOOL_NAMES = {
     "image_generate",
 }
 
+
+def _tool_auto_delivers_media(tool_name: str) -> bool:
+    """Return whether a built-in or capability-gated plugin tool produces media."""
+    if tool_name in _AUTO_APPEND_MEDIA_TOOL_NAMES:
+        return True
+    try:
+        from tools.registry import registry
+
+        entry = registry.get_entry(tool_name)
+    except Exception:
+        return False
+    return bool(entry is not None and entry.auto_deliver_media)
+
 # ---- helpers: detect interrupted tool tails & auto-continue noise ----------
 
 # Replay-tail sanitization lives in agent/replay_cleanup.py so every resume
@@ -2125,7 +2138,7 @@ def _collect_auto_append_media_tags(
         if msg.get("role") not in ("tool", "function"):
             continue
         call_id = str(msg.get("tool_call_id") or msg.get("call_id") or "")
-        if tool_name_by_call_id.get(call_id) not in _AUTO_APPEND_MEDIA_TOOL_NAMES:
+        if not _tool_auto_delivers_media(tool_name_by_call_id.get(call_id, "")):
             continue
         content = str(msg.get("content") or "")
         tool_name = tool_name_by_call_id.get(call_id)
