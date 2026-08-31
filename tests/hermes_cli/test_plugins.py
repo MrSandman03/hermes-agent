@@ -1589,7 +1589,7 @@ class TestPluginContext:
         self, monkeypatch
     ):
         from hermes_cli.plugins import PluginContext, PluginManifest
-        from tools.registry import registry
+        from tools.registry import ToolRegistry, registry
 
         name = "legacy_positional_plugin_override"
         previous = registry.snapshot_registration(name)
@@ -1601,10 +1601,25 @@ class TestPluginContext:
         )
         base_entry = registry.snapshot_registration(name)
         manager = PluginManager()
+        manifest = PluginManifest(
+            name="legacy_override_plugin", source="bundled"
+        )
         context = PluginContext(
             manager=manager,
-            manifest=PluginManifest(name="legacy_override_plugin", source="user"),
+            manifest=manifest,
         )
+        module_name, policy = manager._register_plugin_tool_policy(manifest)
+        context._tool_policy_namespace = module_name
+        context._tool_policy = policy
+        with patch.object(
+            ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
+        ):
+            registry._bind_plugin_registration_context(
+                context,
+                module_name,
+                policy,
+                scope=manager.scope_key,
+            )
         monkeypatch.setattr(context, "_tool_override_allowed", lambda _name: True)
         replacement = lambda *_args, **_kwargs: "replacement"
 
@@ -1633,6 +1648,12 @@ class TestPluginContext:
                 registry.restore_registration(name, current, base_entry)
             if base_entry is not None:
                 registry.restore_registration(name, base_entry, previous)
+            registry.restore_plugin_override_policy(
+                module_name,
+                policy,
+                None,
+                scope=manager.scope_key,
+            )
 
 
 

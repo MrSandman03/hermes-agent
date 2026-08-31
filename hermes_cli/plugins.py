@@ -1467,14 +1467,11 @@ class PluginContext:
         self,
         manifest: PluginManifest,
         manager: "PluginManager",
-        *,
-        tool_policy_namespace: Optional[str] = None,
-        tool_policy: Any = None,
     ):
         self.manifest = manifest
         self._manager = manager
-        self._tool_policy_namespace = tool_policy_namespace
-        self._tool_policy = tool_policy
+        self._tool_policy_namespace: Optional[str] = None
+        self._tool_policy: Any = None
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
@@ -1861,7 +1858,6 @@ class PluginContext:
                 self._tool_policy,
             ) = self._manager._register_plugin_tool_policy(
                 self.manifest,
-                policy_context=self,
             )
         registry.register(
             name=name,
@@ -1878,6 +1874,7 @@ class PluginContext:
             scope=scope,
             _plugin_namespace=self._tool_policy_namespace,
             _plugin_policy=self._tool_policy,
+            _plugin_context=self,
         )
         registered = registry.snapshot_registration(name, scope=scope)
         if (
@@ -5117,7 +5114,18 @@ class PluginManager:
         # a partially-successful register_tools() left behind.
         before = set(self._plugin_tool_names)
         try:
+            tool_context = PluginContext(manifest, self)
             module_name, policy = self._register_plugin_tool_policy(manifest)
+            tool_context._tool_policy_namespace = module_name
+            tool_context._tool_policy = policy
+            from tools.registry import registry as _registry
+
+            _registry._bind_plugin_registration_context(
+                tool_context,
+                module_name,
+                policy,
+                scope=self.scope_key,
+            )
             self._predeclared_tool_policies[lookup_key] = policy
             module = self._load_directory_module(manifest, module_name=module_name)
             # Record the module even if nothing below registers: the package
@@ -5138,14 +5146,7 @@ class PluginManager:
                 )
                 return
 
-            register_tools(
-                PluginContext(
-                    manifest,
-                    self,
-                    tool_policy_namespace=module_name,
-                    tool_policy=policy,
-                )
-            )
+            register_tools(tool_context)
             registered = [
                 t for t in self._plugin_tool_names if t not in before
             ]
@@ -5298,6 +5299,7 @@ class PluginManager:
         from tools.registry import registry as _registry
 
         predeclared_policy = self._predeclared_tool_policies.pop(plugin_key, None)
+        ctx = PluginContext(manifest, self)
         if (
             predeclared_policy is None
             or _registry.snapshot_plugin_override_policy(
@@ -5310,6 +5312,14 @@ class PluginManager:
             )
         else:
             active_tool_policy = predeclared_policy
+        ctx._tool_policy_namespace = _module_name
+        ctx._tool_policy = active_tool_policy
+        _registry._bind_plugin_registration_context(
+            ctx,
+            _module_name,
+            active_tool_policy,
+            scope=self.scope_key,
+        )
         try:
             # A deferred platform whose client tools were already registered at
             # discovery time has its package imported too — reuse it so the
@@ -5332,12 +5342,6 @@ class PluginManager:
                 loaded.error = "no register() function"
                 logger.warning("Plugin '%s' has no register() function", manifest.name)
             else:
-                ctx = PluginContext(
-                    manifest,
-                    self,
-                    tool_policy_namespace=_module_name,
-                    tool_policy=active_tool_policy,
-                )
                 register_fn(ctx)
                 registrations = [
                     registration
@@ -5500,8 +5504,6 @@ class PluginManager:
     def _register_plugin_tool_policy(
         self,
         manifest: PluginManifest,
-        *,
-        policy_context: Optional[PluginContext] = None,
     ) -> tuple[str, Any]:
         """Install one lifecycle-owned, profile-bound tool policy generation.
 
@@ -5514,7 +5516,7 @@ class PluginManager:
 
         module_name = self._policy_module_name(manifest)
         with replacement_coordinator.transaction():
-            policy_context = policy_context or PluginContext(manifest, self)
+            policy_context = PluginContext(manifest, self)
             previous_policy = registry.snapshot_plugin_override_policy(
                 module_name, scope=self.scope_key
             )
