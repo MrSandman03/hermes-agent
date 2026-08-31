@@ -386,6 +386,77 @@ class TestLegacyGateCompat:
         finally:
             handle.dispose()
 
+    def test_imported_media_handler_is_revoked_with_its_context_policy(
+        self, hermes_home
+    ):
+        """Context ownership, not the callable's module, binds media authority."""
+        import json
+
+        import pytest
+
+        from hermes_cli.plugins import PluginContext, PluginManifest, PluginManager
+        from tools.registry import registry
+
+        record_consent(
+            "importplug", ["gateway.media_delivery"], ["gateway.media_delivery"]
+        )
+        manifest = PluginManifest(name="importplug", source="user", key="importplug")
+        manager = PluginManager()
+        module_name, policy = manager._register_plugin_tool_policy(manifest)
+        ctx = PluginContext(
+            manifest,
+            manager,
+            tool_policy_namespace=module_name,
+            tool_policy=policy,
+        )
+        handle = ctx.register_tool(
+            name="importplug_render_package",
+            toolset="importplug",
+            schema={
+                "name": "importplug_render_package",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=json.dumps,
+            auto_deliver_media=True,
+        )
+        entry = registry.snapshot_registration(
+            "importplug_render_package", scope=manager.scope_key
+        )
+        assert handle is not None
+        assert entry is not None
+        assert entry._media_delivery_policy is policy
+
+        replacement = registry.register_plugin_override_policy(
+            module_name,
+            False,
+            media_delivery_allowed=False,
+            scope=manager.scope_key,
+        )
+        try:
+            assert registry.snapshot_registration(
+                "importplug_render_package", scope=manager.scope_key
+            ) is None
+            assert registry.entry_auto_delivers_media(entry) is False
+            with pytest.raises(PermissionError, match="stale or missing policy"):
+                ctx.register_tool(
+                    name="importplug_stale_render",
+                    toolset="importplug",
+                    schema={
+                        "name": "importplug_stale_render",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                    handler=json.dumps,
+                    auto_deliver_media=True,
+                )
+        finally:
+            handle.dispose()
+            registry.restore_plugin_override_policy(
+                module_name,
+                replacement,
+                None,
+                scope=manager.scope_key,
+            )
+
     def test_bundled_plugin_trusted(self, hermes_home):
         from hermes_cli.plugins import PluginContext, PluginManifest, PluginManager
 
