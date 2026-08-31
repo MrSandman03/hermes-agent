@@ -864,6 +864,8 @@ class ToolRegistry:
         scope: Optional[str] = None,
         *,
         auto_deliver_media: bool = False,
+        _plugin_namespace: Optional[str] = None,
+        _plugin_policy: Optional[_PluginOverridePolicy] = None,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -873,9 +875,13 @@ class ToolRegistry:
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
         """
+        if _plugin_policy is not None and _plugin_namespace is None:
+            raise PermissionError(
+                "An explicit plugin policy requires its plugin namespace."
+            )
         handler_owner = self._plugin_owner_of(handler)
         caller_owner = self._plugin_namespace_of_module(self._caller_module())
-        owner = caller_owner or handler_owner
+        owner = _plugin_namespace or caller_owner or handler_owner
         if owner is not None:
             bound_scope = self._plugin_scope_of(owner)
             if scope is not None and scope != bound_scope:
@@ -885,12 +891,25 @@ class ToolRegistry:
                 )
             scope = bound_scope
         with self._lock:
-            media_policy = (
+            current_plugin_policy = (
                 self._plugin_policy(
                     scope,
                     owner,
                     allow_global_fallback=False,
                 )
+                if owner is not None
+                else None
+            )
+            if (
+                _plugin_namespace is not None
+                and current_plugin_policy is not _plugin_policy
+            ):
+                raise PermissionError(
+                    f"Plugin module {_plugin_namespace!r} cannot register a tool "
+                    "with a stale or missing policy generation."
+                )
+            media_policy = (
+                current_plugin_policy
                 if auto_deliver_media and owner is not None
                 else None
             )
