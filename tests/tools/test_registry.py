@@ -706,6 +706,38 @@ class TestDeregisterAuthorization:
 
 
 class TestPluginMediaDeliveryAuthorization:
+    def test_legacy_positional_override_does_not_enable_media_delivery(self):
+        reg = ToolRegistry()
+        schema = _make_schema("legacy_override")
+
+        reg.register(
+            "legacy_override",
+            "base",
+            schema,
+            lambda *_args, **_kwargs: "base",
+        )
+        replacement = lambda *_args, **_kwargs: "replacement"
+        reg.register(
+            "legacy_override",
+            "replacement",
+            schema,
+            replacement,
+            None,
+            None,
+            False,
+            "",
+            "",
+            None,
+            None,
+            True,
+            None,
+        )
+
+        entry = reg.get_entry("legacy_override")
+        assert entry is not None
+        assert entry.handler is replacement
+        assert entry.auto_deliver_media is False
+
     def test_direct_registry_registration_requires_media_delivery_policy(self):
         reg = ToolRegistry()
         module_name = "hermes_plugins.media_producer"
