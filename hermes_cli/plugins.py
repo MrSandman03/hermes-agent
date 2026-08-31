@@ -106,6 +106,11 @@ class PluginToolOverrideError(PermissionError):
 
 logger = logging.getLogger(__name__)
 
+# Installers may probe this source-level contract before enabling a plugin that
+# uses ``register_tool(auto_deliver_media=True)``. Increment for incompatible
+# registration or enforcement changes.
+PLUGIN_MEDIA_DELIVERY_CONTRACT_VERSION = 1
+
 
 # ---------------------------------------------------------------------------
 # Plugin developer debug logging
@@ -1787,6 +1792,8 @@ class PluginContext:
         description: str = "",
         emoji: str = "",
         override: bool = False,
+        *,
+        auto_deliver_media: bool = False,
     ) -> Optional[PluginRegistration]:
         """Register a tool in the global registry **and** track it as plugin-provided.
 
@@ -1812,6 +1819,12 @@ class PluginContext:
                 f"in config.yaml to allow this plugin to replace built-in tools."
             )
 
+        if auto_deliver_media and not self.has_capability("gateway.media_delivery"):
+            raise PermissionError(
+                f"Plugin {self.manifest.name!r} cannot mark tool {name!r} as a "
+                "trusted media producer without gateway.media_delivery consent."
+            )
+
         from tools.registry import registry
 
         scope = self._manager.scope_key
@@ -1834,6 +1847,7 @@ class PluginContext:
             is_async=is_async,
             description=description,
             emoji=emoji,
+            auto_deliver_media=auto_deliver_media,
             override=override,
             scope=scope,
         )
@@ -5237,12 +5251,14 @@ class PluginManager:
         plugin_key = manifest.key or manifest.name
         _module_name = self._policy_module_name(manifest)
         with replacement_coordinator.transaction():
+            policy_context = PluginContext(manifest, self)
             previous_policy = _registry.snapshot_plugin_override_policy(
                 _module_name, scope=self.scope_key
             )
             current_policy = _registry.register_plugin_override_policy(
                 _module_name,
-                PluginContext(manifest, self)._tool_override_allowed(""),
+                policy_context._tool_override_allowed(""),
+                media_delivery_allowed=policy_context.has_capability("gateway.media_delivery"),
                 scope=self.scope_key,
             )
             policy_lease = replacement_coordinator.acquire(

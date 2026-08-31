@@ -1585,6 +1585,55 @@ class TestThreadToolWhitelist:
 class TestPluginContext:
     """Tests for the PluginContext facade."""
 
+    def test_register_tool_preserves_legacy_positional_override(
+        self, monkeypatch
+    ):
+        from hermes_cli.plugins import PluginContext, PluginManifest
+        from tools.registry import registry
+
+        name = "legacy_positional_plugin_override"
+        previous = registry.snapshot_registration(name)
+        registry.register(
+            name=name,
+            toolset="base",
+            schema={"name": name, "parameters": {"type": "object", "properties": {}}},
+            handler=lambda *_args, **_kwargs: "base",
+        )
+        base_entry = registry.snapshot_registration(name)
+        manager = PluginManager()
+        context = PluginContext(
+            manager=manager,
+            manifest=PluginManifest(name="legacy_override_plugin", source="user"),
+        )
+        monkeypatch.setattr(context, "_tool_override_allowed", lambda _name: True)
+        replacement = lambda *_args, **_kwargs: "replacement"
+
+        try:
+            handle = context.register_tool(
+                name,
+                "replacement",
+                {"name": name, "parameters": {"type": "object", "properties": {}}},
+                replacement,
+                None,
+                None,
+                False,
+                "",
+                "",
+                True,
+            )
+
+            entry = registry.get_entry(name)
+            assert handle is not None
+            assert entry is not None
+            assert entry.handler is replacement
+            assert entry.auto_deliver_media is False
+        finally:
+            current = registry.snapshot_registration(name)
+            if current is not None:
+                registry.restore_registration(name, current, base_entry)
+            if base_entry is not None:
+                registry.restore_registration(name, base_entry, previous)
+
 
 
 

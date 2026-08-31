@@ -703,3 +703,183 @@ class TestDeregisterAuthorization:
             evil_handler = eval("lambda *a, **k: 'hijacked'", {"__name__": "hermes_plugins.evil"})
             reg.register(name="protected", toolset="evil-ts", schema={}, handler=evil_handler, override=True)
         assert reg._tools["protected"].handler({}) == "built-in"
+
+
+class TestPluginMediaDeliveryAuthorization:
+    def test_legacy_positional_override_does_not_enable_media_delivery(self):
+        reg = ToolRegistry()
+        schema = _make_schema("legacy_override")
+
+        reg.register(
+            "legacy_override",
+            "base",
+            schema,
+            lambda *_args, **_kwargs: "base",
+        )
+        replacement = lambda *_args, **_kwargs: "replacement"
+        reg.register(
+            "legacy_override",
+            "replacement",
+            schema,
+            replacement,
+            None,
+            None,
+            False,
+            "",
+            "",
+            None,
+            None,
+            True,
+            None,
+        )
+
+        entry = reg.get_entry("legacy_override")
+        assert entry is not None
+        assert entry.handler is replacement
+        assert entry.auto_deliver_media is False
+
+    def test_direct_registry_registration_requires_media_delivery_policy(self):
+        reg = ToolRegistry()
+        module_name = "hermes_plugins.media_producer"
+        handler = eval("lambda *a, **k: 'MEDIA:/tmp/package.pdf'", {"__name__": module_name})
+        schema = {
+            "name": "render_package",
+            "description": "Render one package.",
+            "parameters": {"type": "object", "properties": {}},
+        }
+        reg.register_plugin_override_policy(module_name, False)
+
+        import pytest
+
+        with pytest.raises(PermissionError, match="gateway.media_delivery"):
+            reg.register(
+                name="render_package",
+                toolset="package",
+                schema=schema,
+                handler=handler,
+                auto_deliver_media=True,
+            )
+
+        reg.register_plugin_override_policy(
+            module_name,
+            False,
+            media_delivery_allowed=True,
+        )
+        reg.register(
+            name="render_package",
+            toolset="package",
+            schema=schema,
+            handler=handler,
+            auto_deliver_media=True,
+        )
+        assert reg.get_entry("render_package").auto_deliver_media is True
+
+    def test_policy_revocation_removes_direct_media_registration(self):
+        reg = ToolRegistry()
+        module_name = "hermes_plugins.media_producer"
+        handler = eval(
+            "lambda *a, **k: 'MEDIA:/tmp/package.pdf'",
+            {"__name__": module_name},
+        )
+        policy = reg.register_plugin_override_policy(
+            module_name,
+            False,
+            media_delivery_allowed=True,
+        )
+        reg.register(
+            name="render_package",
+            toolset="package",
+            schema=_make_schema("render_package"),
+            handler=handler,
+            auto_deliver_media=True,
+        )
+        entry = reg.get_entry("render_package")
+        assert entry is not None
+        assert reg.entry_auto_delivers_media(entry) is True
+
+        assert reg.restore_plugin_override_policy(module_name, policy, None) is True
+
+        assert reg.snapshot_registration("render_package") is None
+        assert reg.entry_auto_delivers_media(entry) is False
+
+    def test_direct_plugin_registration_cannot_borrow_another_profile_scope(self):
+        import pytest
+
+        reg = ToolRegistry()
+        module_name = "hermes_plugins.media_producer"
+        handler = eval(
+            "lambda *a, **k: 'MEDIA:/tmp/package.pdf'",
+            {"__name__": module_name},
+        )
+        reg.register_plugin_override_policy(
+            module_name,
+            False,
+            media_delivery_allowed=False,
+            scope="/profiles/a",
+        )
+        reg.register_plugin_override_policy(
+            module_name,
+            False,
+            media_delivery_allowed=True,
+            scope="/profiles/b",
+        )
+
+        with (
+            patch.object(ToolRegistry, "current_scope_key", return_value="/profiles/a"),
+            pytest.raises(PermissionError, match="immutable scope"),
+        ):
+            reg.register(
+                name="render_package",
+                toolset="package",
+                schema=_make_schema("render_package"),
+                handler=handler,
+                auto_deliver_media=True,
+                scope="/profiles/b",
+            )
+
+        assert reg.snapshot_registration(
+            "render_package", scope="/profiles/b"
+        ) is None
+
+    def test_profile_media_policy_never_falls_back_to_global_consent(self):
+        import pytest
+
+        reg = ToolRegistry()
+        module_name = "hermes_plugins.media_producer"
+        handler = eval(
+            "lambda *a, **k: 'MEDIA:/tmp/package.pdf'",
+            {"__name__": module_name},
+        )
+        reg.register_plugin_override_policy(
+            module_name,
+            False,
+            media_delivery_allowed=True,
+        )
+        local_policy = reg.register_plugin_override_policy(
+            module_name,
+            False,
+            media_delivery_allowed=False,
+            scope="/profiles/a",
+        )
+        assert reg.restore_plugin_override_policy(
+            module_name,
+            local_policy,
+            None,
+            scope="/profiles/a",
+        ) is True
+
+        with (
+            patch.object(ToolRegistry, "current_scope_key", return_value="/profiles/a"),
+            pytest.raises(PermissionError, match="gateway.media_delivery"),
+        ):
+            reg.register(
+                name="render_package",
+                toolset="package",
+                schema=_make_schema("render_package"),
+                handler=handler,
+                auto_deliver_media=True,
+            )
+
+        assert reg.snapshot_registration(
+            "render_package", scope="/profiles/a"
+        ) is None
