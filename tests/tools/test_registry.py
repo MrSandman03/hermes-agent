@@ -751,7 +751,7 @@ class TestPluginMediaDeliveryAuthorization:
 
         import pytest
 
-        with pytest.raises(PermissionError, match="gateway.media_delivery"):
+        with pytest.raises(PermissionError, match="host-bound PluginContext"):
             reg.register(
                 name="render_package",
                 toolset="package",
@@ -765,16 +765,19 @@ class TestPluginMediaDeliveryAuthorization:
             False,
             media_delivery_allowed=True,
         )
-        reg.register(
-            name="render_package",
-            toolset="package",
-            schema=schema,
-            handler=handler,
-            auto_deliver_media=True,
-        )
-        assert reg.get_entry("render_package").auto_deliver_media is True
+        with pytest.raises(PermissionError, match="host-bound PluginContext"):
+            reg.register(
+                name="render_package",
+                toolset="package",
+                schema=schema,
+                handler=handler,
+                auto_deliver_media=True,
+            )
+        assert reg.get_entry("render_package") is None
 
-    def test_policy_revocation_removes_direct_media_registration(self):
+    def test_self_minted_policy_does_not_enable_direct_media_registration(self):
+        import pytest
+
         reg = ToolRegistry()
         module_name = "hermes_plugins.media_producer"
         handler = eval(
@@ -786,21 +789,16 @@ class TestPluginMediaDeliveryAuthorization:
             False,
             media_delivery_allowed=True,
         )
-        reg.register(
-            name="render_package",
-            toolset="package",
-            schema=_make_schema("render_package"),
-            handler=handler,
-            auto_deliver_media=True,
-        )
-        entry = reg.get_entry("render_package")
-        assert entry is not None
-        assert reg.entry_auto_delivers_media(entry) is True
-
+        with pytest.raises(PermissionError, match="host-bound PluginContext"):
+            reg.register(
+                name="render_package",
+                toolset="package",
+                schema=_make_schema("render_package"),
+                handler=handler,
+                auto_deliver_media=True,
+            )
         assert reg.restore_plugin_override_policy(module_name, policy, None) is True
-
         assert reg.snapshot_registration("render_package") is None
-        assert reg.entry_auto_delivers_media(entry) is False
 
     def test_direct_plugin_registration_cannot_borrow_another_profile_scope(self):
         import pytest
@@ -909,9 +907,13 @@ class TestPluginMediaDeliveryAuthorization:
             scope="/profiles/a",
         ) is True
 
+        global_policy = reg.snapshot_plugin_override_policy(module_name)
         with (
             patch.object(ToolRegistry, "current_scope_key", return_value="/profiles/a"),
-            pytest.raises(PermissionError, match="gateway.media_delivery"),
+            patch.object(
+                ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
+            ),
+            pytest.raises(PermissionError, match="stale or missing policy"),
         ):
             reg.register(
                 name="render_package",
@@ -919,6 +921,8 @@ class TestPluginMediaDeliveryAuthorization:
                 schema=_make_schema("render_package"),
                 handler=handler,
                 auto_deliver_media=True,
+                _plugin_namespace=module_name,
+                _plugin_policy=global_policy,
             )
 
         assert reg.snapshot_registration(

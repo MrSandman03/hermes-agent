@@ -22,6 +22,7 @@ import logging
 import sys
 import threading
 import time
+import weakref
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
@@ -483,6 +484,11 @@ class ToolRegistry:
             _PluginOverridePolicy,
             List[tuple[Optional[str], str, ToolEntry, Optional[ToolEntry]]],
         ] = {}
+        # Privileged PluginContext registrations are accepted only from the
+        # exact context object bound by PluginManager before plugin code runs.
+        # A policy object is intentionally insufficient: plugins can inspect
+        # registry state, construct facade objects, and call public methods.
+        self._plugin_registration_contexts = weakref.WeakKeyDictionary()
         # Scope attribution stays durable after policy removal so delayed code
         # remains confined to the profile where its module was loaded.
         self._plugin_module_scopes: Dict[str, Set[Optional[str]]] = {}
@@ -694,6 +700,36 @@ class ToolRegistry:
         if changed:
             self._generation += 1
 
+    def _bind_plugin_registration_context(
+        self,
+        context: object,
+        module_namespace: str,
+        policy: _PluginOverridePolicy,
+        *,
+        scope: Optional[str] = None,
+    ) -> None:
+        """Bind one host-created context to an exact policy generation."""
+        if self._caller_module() != "hermes_cli.plugins":
+            raise PermissionError(
+                "Plugin registration contexts may only be bound by the plugin host."
+            )
+        with self._lock:
+            current = self._plugin_policy(
+                scope,
+                module_namespace,
+                allow_global_fallback=False,
+            )
+            if current is not policy:
+                raise PermissionError(
+                    f"Plugin module {module_namespace!r} cannot bind a stale or "
+                    "missing policy generation."
+                )
+            self._plugin_registration_contexts[context] = (
+                scope,
+                module_namespace,
+                policy,
+            )
+
     def _plugin_policy(
         self,
         scope: Optional[str],
@@ -866,6 +902,7 @@ class ToolRegistry:
         auto_deliver_media: bool = False,
         _plugin_namespace: Optional[str] = None,
         _plugin_policy: Optional[_PluginOverridePolicy] = None,
+        _plugin_context: object = None,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -914,6 +951,17 @@ class ToolRegistry:
                     f"Plugin module {_plugin_namespace!r} cannot register a tool "
                     "with a stale or missing policy generation."
                 )
+            if owner is not None and (override or auto_deliver_media):
+                expected_binding = (scope, owner, current_plugin_policy)
+                if (
+                    _plugin_context is None
+                    or self._plugin_registration_contexts.get(_plugin_context)
+                    != expected_binding
+                ):
+                    raise PermissionError(
+                        f"Plugin module {owner!r} cannot perform a privileged tool "
+                        "registration outside its host-bound PluginContext."
+                    )
             media_policy = (
                 current_plugin_policy
                 if auto_deliver_media and owner is not None

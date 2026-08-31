@@ -375,54 +375,163 @@ class TestLegacyGateCompat:
         record_consent(
             "capplug", ["gateway.media_delivery"], ["gateway.media_delivery"]
         )
-        handle = ctx.register_tool(**kwargs)
-        assert handle is not None
+        with pytest.raises(PermissionError, match="host-bound PluginContext"):
+            ctx.register_tool(**kwargs)
+        assert registry.get_entry(
+            "capplug_render_package", scope=manager.scope_key
+        ) is None
+
+    def test_forged_context_cannot_use_a_self_minted_media_policy(self, hermes_home):
+        from hermes_cli.plugins import PluginContext, PluginManifest, PluginManager
+        from tools.registry import registry
+
+        manifest = PluginManifest(name="forged", source="user", key="forged")
+        manager = PluginManager()
+        record_consent(
+            "forged", ["gateway.media_delivery"], ["gateway.media_delivery"]
+        )
+        module_name = manager._policy_module_name(manifest)
+        policy = registry.register_plugin_override_policy(
+            module_name,
+            False,
+            media_delivery_allowed=True,
+            scope=manager.scope_key,
+        )
+        forged = PluginContext(manifest, manager)
+        forged._tool_policy_namespace = module_name
+        forged._tool_policy = policy
         try:
-            entry = registry.get_entry(
-                "capplug_render_package", scope=manager.scope_key
-            )
-            assert entry is not None
-            assert entry.auto_deliver_media is True
+            with pytest.raises(PermissionError, match="host-bound PluginContext"):
+                forged.register_tool(
+                    name="forged_render_package",
+                    toolset="forged",
+                    schema={
+                        "name": "forged_render_package",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                    handler=lambda _args: "MEDIA:/tmp/package.pdf",
+                    auto_deliver_media=True,
+                )
+            assert registry.snapshot_registration(
+                "forged_render_package", scope=manager.scope_key
+            ) is None
         finally:
-            handle.dispose()
+            registry.restore_plugin_override_policy(
+                module_name,
+                policy,
+                None,
+                scope=manager.scope_key,
+            )
+
+    def test_loaded_context_cannot_borrow_another_plugin_media_policy(
+        self, hermes_home, tmp_path
+    ):
+        from hermes_cli.plugins import PluginManifest, PluginManager
+        from tools.registry import registry
+
+        record_consent(
+            "trusted", ["gateway.media_delivery"], ["gateway.media_delivery"]
+        )
+        manager = PluginManager()
+        manifests = {}
+        for key in ("attacker", "trusted"):
+            plugin_dir = tmp_path / key
+            plugin_dir.mkdir()
+            (plugin_dir / "__init__.py").write_text(
+                "CONTEXT = None\n"
+                "def register(ctx):\n"
+                "    global CONTEXT\n"
+                "    CONTEXT = ctx\n",
+                encoding="utf-8",
+            )
+            manifest = PluginManifest(
+                name=key,
+                source="user",
+                key=key,
+                path=str(plugin_dir),
+            )
+            manifests[key] = manifest
+            manager._load_plugin(manifest)
+            assert manager._plugins[key].enabled is True
+
+        attacker_context = manager._plugins["attacker"].module.CONTEXT
+        trusted_manifest = manifests["trusted"]
+        trusted_namespace = manager._policy_module_name(trusted_manifest)
+        trusted_policy = registry.snapshot_plugin_override_policy(
+            trusted_namespace, scope=manager.scope_key
+        )
+        assert trusted_policy is not None
+        attacker_context.manifest = trusted_manifest
+        attacker_context._tool_policy_namespace = trusted_namespace
+        attacker_context._tool_policy = trusted_policy
+
+        try:
+            with pytest.raises(PermissionError, match="host-bound PluginContext"):
+                attacker_context.register_tool(
+                    name="borrowed_render_package",
+                    toolset="trusted",
+                    schema={
+                        "name": "borrowed_render_package",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                    handler=lambda _args: "MEDIA:/tmp/package.pdf",
+                    auto_deliver_media=True,
+                )
+            assert registry.snapshot_registration(
+                "borrowed_render_package", scope=manager.scope_key
+            ) is None
+        finally:
+            manager.unload(manifests["attacker"])
+            manager.unload(trusted_manifest)
 
     def test_imported_media_handler_is_revoked_with_its_context_policy(
-        self, hermes_home
+        self, hermes_home, tmp_path
     ):
         """Context ownership, not the callable's module, binds media authority."""
-        import json
-
-        import pytest
-
-        from hermes_cli.plugins import PluginContext, PluginManifest, PluginManager
+        from hermes_cli.plugins import PluginManifest, PluginManager
         from tools.registry import registry
 
         record_consent(
             "importplug", ["gateway.media_delivery"], ["gateway.media_delivery"]
         )
-        manifest = PluginManifest(name="importplug", source="user", key="importplug")
-        manager = PluginManager()
-        module_name, policy = manager._register_plugin_tool_policy(manifest)
-        ctx = PluginContext(
-            manifest,
-            manager,
-            tool_policy_namespace=module_name,
-            tool_policy=policy,
+        plugin_dir = tmp_path / "importplug"
+        plugin_dir.mkdir()
+        (plugin_dir / "__init__.py").write_text(
+            "import json\n"
+            "CONTEXT = None\n"
+            "def register(ctx):\n"
+            "    global CONTEXT\n"
+            "    CONTEXT = ctx\n"
+            "    ctx.register_tool(\n"
+            "        name='importplug_render_package',\n"
+            "        toolset='importplug',\n"
+            "        schema={'name': 'importplug_render_package', "
+            "'parameters': {'type': 'object', 'properties': {}}},\n"
+            "        handler=json.dumps,\n"
+            "        auto_deliver_media=True,\n"
+            "    )\n",
+            encoding="utf-8",
         )
-        handle = ctx.register_tool(
-            name="importplug_render_package",
-            toolset="importplug",
-            schema={
-                "name": "importplug_render_package",
-                "parameters": {"type": "object", "properties": {}},
-            },
-            handler=json.dumps,
-            auto_deliver_media=True,
+        manifest = PluginManifest(
+            name="importplug",
+            source="user",
+            key="importplug",
+            path=str(plugin_dir),
+        )
+        manager = PluginManager()
+        manager._load_plugin(manifest)
+        loaded = manager._plugins["importplug"]
+        assert loaded.enabled is True
+        assert loaded.module is not None
+        ctx = loaded.module.CONTEXT
+        module_name = manager._policy_module_name(manifest)
+        policy = registry.snapshot_plugin_override_policy(
+            module_name, scope=manager.scope_key
         )
         entry = registry.snapshot_registration(
             "importplug_render_package", scope=manager.scope_key
         )
-        assert handle is not None
+        assert policy is not None
         assert entry is not None
         assert entry._media_delivery_policy is policy
 
@@ -445,17 +554,17 @@ class TestLegacyGateCompat:
                         "name": "importplug_stale_render",
                         "parameters": {"type": "object", "properties": {}},
                     },
-                    handler=json.dumps,
+                    handler=entry.handler,
                     auto_deliver_media=True,
                 )
         finally:
-            handle.dispose()
             registry.restore_plugin_override_policy(
                 module_name,
                 replacement,
-                None,
+                policy,
                 scope=manager.scope_key,
             )
+            manager.unload(manifest)
 
     def test_bundled_plugin_trusted(self, hermes_home):
         from hermes_cli.plugins import PluginContext, PluginManifest, PluginManager
