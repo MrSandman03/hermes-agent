@@ -11,6 +11,46 @@ from types import MethodType
 import yaml
 
 
+def _host_register_plugin_policy(registry, *args, **kwargs):
+    from unittest.mock import patch
+
+    from tools.registry import ToolRegistry
+
+    with patch.object(
+        ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
+    ):
+        return registry.register_plugin_override_policy(*args, **kwargs)
+
+
+def _host_restore_plugin_policy(registry, *args, **kwargs):
+    from unittest.mock import patch
+
+    from tools.registry import ToolRegistry
+
+    with patch.object(
+        ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
+    ):
+        return registry.restore_plugin_override_policy(*args, **kwargs)
+
+
+def _host_bind_plugin_context(registry, namespace, policy, *, scope):
+    from unittest.mock import patch
+
+    from tools.registry import ToolRegistry
+
+    class _Context:
+        pass
+
+    context = _Context()
+    with patch.object(
+        ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
+    ):
+        registry._bind_plugin_registration_context(
+            context, namespace, policy, scope=scope
+        )
+    return context
+
+
 def _write_plugin(hermes_home: Path) -> None:
     plugin_dir = hermes_home / "plugins" / "ledger_probe"
     plugin_dir.mkdir(parents=True)
@@ -436,13 +476,22 @@ def test_scoped_plugin_cannot_deregister_a_process_global_tool():
         handler=lambda args, **kwargs: "base",
     )
     module_name = "hermes_plugins.scoped_cleanup"
-    registry.register_plugin_override_policy(
+    policy = _host_register_plugin_policy(
+        registry,
         module_name, True, scope="/profiles/isolated"
     )
+    context = _host_bind_plugin_context(
+        registry,
+        module_name,
+        policy,
+        scope="/profiles/isolated",
+    )
 
-    with patch.object(ToolRegistry, "_caller_module", return_value=module_name):
+    with patch.object(
+        ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
+    ):
         with pytest.raises(PermissionError, match="process-global"):
-            registry.deregister(name)
+            registry.deregister(name, _plugin_context=context)
 
     assert registry.snapshot_registration(name) is not None
 
@@ -459,11 +508,16 @@ def test_shared_entrypoint_module_uses_the_active_profile_scope(tmp_path):
     home_a = str((tmp_path / "entrypoint-a").resolve())
     home_b = str((tmp_path / "entrypoint-b").resolve())
     home_c = str((tmp_path / "entrypoint-c").resolve())
-    policy_a = registry.register_plugin_override_policy(
+    policy_a = _host_register_plugin_policy(
+        registry,
         module_name, False, scope=home_a
     )
-    policy_b = registry.register_plugin_override_policy(
+    policy_b = _host_register_plugin_policy(
+        registry,
         module_name, False, scope=home_b
+    )
+    context_a = _host_bind_plugin_context(
+        registry, module_name, policy_a, scope=home_a
     )
     handler = eval("lambda args, **kwargs: 'shared'", {"__name__": module_name})
 
@@ -493,8 +547,12 @@ def test_shared_entrypoint_module_uses_the_active_profile_scope(tmp_path):
 
     token = set_hermes_home_override(home_a)
     try:
-        with patch.object(ToolRegistry, "_caller_module", return_value=module_name):
-            registry.deregister("shared_entrypoint_a")
+        with patch.object(
+            ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
+        ):
+            registry.deregister(
+                "shared_entrypoint_a", _plugin_context=context_a
+            )
     finally:
         reset_hermes_home_override(token)
     assert registry.snapshot_registration("shared_entrypoint_a", scope=home_a) is None
@@ -502,10 +560,12 @@ def test_shared_entrypoint_module_uses_the_active_profile_scope(tmp_path):
 
     # Policy unload revokes authorization but durable scope attribution keeps
     # a stale delayed callback out of the process-global registry.
-    registry.restore_plugin_override_policy(
+    _host_restore_plugin_policy(
+        registry,
         module_name, policy_a, None, scope=home_a
     )
-    registry.restore_plugin_override_policy(
+    _host_restore_plugin_policy(
+        registry,
         module_name, policy_b, None, scope=home_b
     )
     register_in(home_a, "shared_entrypoint_stale")
@@ -525,7 +585,7 @@ def test_decorated_plugin_callable_keeps_its_defining_module_scope(tmp_path):
     registry = ToolRegistry()
     module_name = "third_party.decorated_plugin"
     scope = str((tmp_path / "decorated-profile").resolve())
-    registry.register_plugin_override_policy(module_name, False, scope=scope)
+    _host_register_plugin_policy(registry, module_name, False, scope=scope)
     namespace = {"__name__": module_name, "functools": functools}
     exec(
         "@functools.wraps(str)\n"
@@ -557,8 +617,9 @@ def test_entrypoint_policy_uses_the_most_specific_module_prefix(tmp_path):
     registry = ToolRegistry()
     broad_scope = str((tmp_path / "broad").resolve())
     narrow_scope = str((tmp_path / "narrow").resolve())
-    registry.register_plugin_override_policy("vendor", True, scope=broad_scope)
-    registry.register_plugin_override_policy(
+    _host_register_plugin_policy(registry, "vendor", True, scope=broad_scope)
+    _host_register_plugin_policy(
+        registry,
         "vendor.plugin", False, scope=narrow_scope
     )
     handler = eval(
@@ -1120,7 +1181,8 @@ def test_direct_plugin_platform_registration_infers_immutable_scope(tmp_path):
     home_a = str((tmp_path / "direct-a").resolve())
     home_b = tmp_path / "direct-b"
     module_name = "company.hermes.direct_platform_probe"
-    policy = tool_registry.register_plugin_override_policy(
+    policy = _host_register_plugin_policy(
+        tool_registry,
         module_name, False, scope=home_a
     )
     factory = eval(
@@ -1159,7 +1221,8 @@ def test_direct_plugin_platform_registration_infers_immutable_scope(tmp_path):
             platform_registry.restore_registration(
                 name, current_global, previous_global
             )
-        tool_registry.restore_plugin_override_policy(
+        _host_restore_plugin_policy(
+            tool_registry,
             module_name, policy, None, scope=home_a
         )
 

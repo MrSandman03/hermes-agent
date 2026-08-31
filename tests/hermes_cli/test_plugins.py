@@ -1648,12 +1648,15 @@ class TestPluginContext:
                 registry.restore_registration(name, current, base_entry)
             if base_entry is not None:
                 registry.restore_registration(name, base_entry, previous)
-            registry.restore_plugin_override_policy(
-                module_name,
-                policy,
-                None,
-                scope=manager.scope_key,
-            )
+            with patch.object(
+                ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
+            ):
+                registry.restore_plugin_override_policy(
+                    module_name,
+                    policy,
+                    None,
+                    scope=manager.scope_key,
+                )
 
 
 

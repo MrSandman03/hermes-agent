@@ -6,6 +6,8 @@ import threading
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from tools.registry import (
     ToolRegistry,
     _MAX_LOGGED_ERROR_CHARS,
@@ -26,6 +28,20 @@ def _make_schema(name="test_tool"):
         "description": f"A {name}",
         "parameters": {"type": "object", "properties": {}},
     }
+
+
+def _host_register_plugin_policy(registry, *args, **kwargs):
+    with patch.object(
+        ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
+    ):
+        return registry.register_plugin_override_policy(*args, **kwargs)
+
+
+def _host_restore_plugin_policy(registry, *args, **kwargs):
+    with patch.object(
+        ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
+    ):
+        return registry.restore_plugin_override_policy(*args, **kwargs)
 
 
 class TestRegisterAndDispatch:
@@ -626,12 +642,24 @@ class TestDeregisterAuthorization:
         )
         return reg
 
+    @staticmethod
+    def _bound_context(reg, namespace, *, allowed):
+        class _Context:
+            pass
+
+        context = _Context()
+        policy = _host_register_plugin_policy(reg, namespace, allowed)
+        with patch.object(
+            ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
+        ):
+            reg._bind_plugin_registration_context(context, namespace, policy)
+        return context
+
     def test_plugin_cannot_deregister_unowned_tool_without_opt_in(self):
         reg = self._reg()
-        reg.register_plugin_override_policy("hermes_plugins.evil", False)
+        _host_register_plugin_policy(reg, "hermes_plugins.evil", False)
         with patch.object(ToolRegistry, "_caller_module", return_value="hermes_plugins.evil"):
-            import pytest
-            with pytest.raises(PermissionError, match="allow_tool_override"):
+            with pytest.raises(PermissionError, match="host-bound PluginContext"):
                 reg.deregister("protected")
         assert reg._tools.get("protected") is not None, "tool must survive the rejected deregister"
 
@@ -646,17 +674,21 @@ class TestDeregisterAuthorization:
         module (egilewski review, #55840).
         """
         reg = ToolRegistry()
-        reg.register_plugin_override_policy("hermes_plugins.pkg", False)
+        context = self._bound_context(
+            reg, "hermes_plugins.pkg", allowed=False
+        )
         handler = eval("lambda *a, **k: 'sub'", {"__name__": "hermes_plugins.pkg.handlers"})
         reg.register(
             name="sub_tool", toolset="pkg-ts",
             schema={"name": "sub_tool", "description": "", "parameters": {"type": "object", "properties": {}}},
             handler=handler,
         )
-        # Caller is the plugin root (hermes_plugins.pkg), handler is in a
-        # submodule (hermes_plugins.pkg.handlers) — must be allowed.
-        with patch.object(ToolRegistry, "_caller_module", return_value="hermes_plugins.pkg"):
-            reg.deregister("sub_tool")
+        # The loader-bound facade may clean up a handler from any submodule in
+        # the same plugin package.
+        with patch.object(
+            ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
+        ):
+            reg.deregister("sub_tool", _plugin_context=context)
         assert reg._tools.get("sub_tool") is None
 
     def test_opted_in_plugin_submodule_can_deregister(self):
@@ -676,10 +708,59 @@ class TestDeregisterAuthorization:
             schema={"name": "protected", "description": "", "parameters": {"type": "object", "properties": {}}},
             handler=lambda *a, **k: "built-in",
         )
-        reg.register_plugin_override_policy("hermes_plugins.allowed", True)
-        with patch.object(ToolRegistry, "_caller_module", return_value="hermes_plugins.allowed.cleanup"):
-            reg.deregister("protected")
+        context = self._bound_context(
+            reg, "hermes_plugins.allowed", allowed=True
+        )
+        with patch.object(
+            ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
+        ):
+            reg.deregister("protected", _plugin_context=context)
         assert reg._tools.get("protected") is None
+
+    def test_self_minted_policy_cannot_authorize_deregistration(self):
+        reg = self._reg()
+        context = object()
+        with patch.object(
+            ToolRegistry,
+            "_caller_module",
+            return_value="hermes_plugins.attacker.tools",
+        ):
+            with pytest.raises(PermissionError, match="plugin host"):
+                reg.register_plugin_override_policy(
+                    "hermes_plugins.attacker", True
+                )
+
+        with patch.object(
+            ToolRegistry,
+            "_caller_module",
+            return_value="hermes_plugins.attacker.tools",
+        ):
+            with pytest.raises(PermissionError, match="plugin host facade"):
+                reg.deregister("protected", _plugin_context=context)
+
+        assert reg._tools.get("protected") is not None
+
+    def test_bound_plugin_cannot_use_mcp_toolset_as_override_bypass(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="mcp__protected__read",
+            toolset="mcp-protected",
+            schema=_make_schema("mcp__protected__read"),
+            handler=lambda *_args, **_kwargs: "protected",
+        )
+        context = self._bound_context(
+            reg, "hermes_plugins.attacker", allowed=False
+        )
+
+        with patch.object(
+            ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
+        ):
+            with pytest.raises(PermissionError, match="allow_tool_override"):
+                reg.deregister(
+                    "mcp__protected__read", _plugin_context=context
+                )
+
+        assert reg._tools.get("mcp__protected__read") is not None
 
 
     def test_core_code_deregister_always_allowed(self):
@@ -692,9 +773,8 @@ class TestDeregisterAuthorization:
     def test_full_bypass_blocked(self):
         """The original bypass: deregister then plain register no longer works."""
         reg = self._reg()
-        reg.register_plugin_override_policy("hermes_plugins.evil", False)
+        _host_register_plugin_policy(reg, "hermes_plugins.evil", False)
         with patch.object(ToolRegistry, "_caller_module", return_value="hermes_plugins.evil"):
-            import pytest
             with pytest.raises(PermissionError):
                 reg.deregister("protected")
         # Tool is still present, so a follow-up plain register() hits the
@@ -747,7 +827,7 @@ class TestPluginMediaDeliveryAuthorization:
             "description": "Render one package.",
             "parameters": {"type": "object", "properties": {}},
         }
-        reg.register_plugin_override_policy(module_name, False)
+        _host_register_plugin_policy(reg, module_name, False)
 
         import pytest
 
@@ -760,7 +840,8 @@ class TestPluginMediaDeliveryAuthorization:
                 auto_deliver_media=True,
             )
 
-        reg.register_plugin_override_policy(
+        _host_register_plugin_policy(
+            reg,
             module_name,
             False,
             media_delivery_allowed=True,
@@ -784,7 +865,17 @@ class TestPluginMediaDeliveryAuthorization:
             "lambda *a, **k: 'MEDIA:/tmp/package.pdf'",
             {"__name__": module_name},
         )
-        policy = reg.register_plugin_override_policy(
+        with patch.object(
+            ToolRegistry, "_caller_module", return_value=module_name
+        ):
+            with pytest.raises(PermissionError, match="plugin host"):
+                reg.register_plugin_override_policy(
+                    module_name,
+                    False,
+                    media_delivery_allowed=True,
+                )
+        policy = _host_register_plugin_policy(
+            reg,
             module_name,
             False,
             media_delivery_allowed=True,
@@ -797,7 +888,7 @@ class TestPluginMediaDeliveryAuthorization:
                 handler=handler,
                 auto_deliver_media=True,
             )
-        assert reg.restore_plugin_override_policy(module_name, policy, None) is True
+        assert _host_restore_plugin_policy(reg, module_name, policy, None) is True
         assert reg.snapshot_registration("render_package") is None
 
     def test_direct_plugin_registration_cannot_borrow_another_profile_scope(self):
@@ -809,13 +900,15 @@ class TestPluginMediaDeliveryAuthorization:
             "lambda *a, **k: 'MEDIA:/tmp/package.pdf'",
             {"__name__": module_name},
         )
-        reg.register_plugin_override_policy(
+        _host_register_plugin_policy(
+            reg,
             module_name,
             False,
             media_delivery_allowed=False,
             scope="/profiles/a",
         )
-        reg.register_plugin_override_policy(
+        _host_register_plugin_policy(
+            reg,
             module_name,
             False,
             media_delivery_allowed=True,
@@ -846,13 +939,15 @@ class TestPluginMediaDeliveryAuthorization:
         scope = "/profiles/a"
         attacker = "hermes_plugins.attacker"
         trusted = "hermes_plugins.trusted"
-        reg.register_plugin_override_policy(
+        _host_register_plugin_policy(
+            reg,
             attacker,
             False,
             media_delivery_allowed=False,
             scope=scope,
         )
-        stolen_policy = reg.register_plugin_override_policy(
+        stolen_policy = _host_register_plugin_policy(
+            reg,
             trusted,
             False,
             media_delivery_allowed=True,
@@ -889,18 +984,21 @@ class TestPluginMediaDeliveryAuthorization:
             "lambda *a, **k: 'MEDIA:/tmp/package.pdf'",
             {"__name__": module_name},
         )
-        reg.register_plugin_override_policy(
+        _host_register_plugin_policy(
+            reg,
             module_name,
             False,
             media_delivery_allowed=True,
         )
-        local_policy = reg.register_plugin_override_policy(
+        local_policy = _host_register_plugin_policy(
+            reg,
             module_name,
             False,
             media_delivery_allowed=False,
             scope="/profiles/a",
         )
-        assert reg.restore_plugin_override_policy(
+        assert _host_restore_plugin_policy(
+            reg,
             module_name,
             local_policy,
             None,
