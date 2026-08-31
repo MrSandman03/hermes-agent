@@ -326,6 +326,43 @@ caption
         assert tags == []
         assert voice is False
 
+    def test_gateway_auto_appends_media_from_registered_trusted_producer(self):
+        from gateway.run import _collect_auto_append_media_tags
+        from tools.registry import registry
+
+        tool_name = "test_render_package_media"
+        registry.register(
+            name=tool_name,
+            toolset="test-package",
+            schema={
+                "name": tool_name,
+                "description": "Render a package.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=lambda _args: "MEDIA:/tmp/package.pdf",
+            auto_deliver_media=True,
+        )
+        try:
+            messages = [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"id": "call-package", "function": {"name": tool_name}}
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-package",
+                    "content": "Prepared files. MEDIA:/tmp/package.pdf",
+                },
+            ]
+
+            tags, voice = _collect_auto_append_media_tags(messages)
+            assert tags == ["MEDIA:/tmp/package.pdf"]
+            assert voice is False
+        finally:
+            registry.deregister(tool_name)
+
 
     def test_collect_history_media_paths_includes_image_generate_json(self):
         """Regression for #46627: the history media-path collector must pick up

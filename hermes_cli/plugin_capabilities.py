@@ -26,6 +26,7 @@ Capability id                Legacy config gate (``plugins.entries.<id>.…``)
 ``llm.profile_override``     ``llm.allow_profile_override``
 ``llm.task_override``        ``llm.allow_task_override``
 ``gateway.platform_actions`` ``allow_platform_actions``
+``gateway.media_delivery``   ``allow_media_delivery``
 ===========================  ==================================================
 
 The legacy ``allow_*`` keys keep working verbatim (deprecated but honored):
@@ -126,6 +127,15 @@ CAPABILITY_REGISTRY: Dict[str, CapabilitySpec] = {
             description=(
                 "Act on connected chat platforms as the gateway bot "
                 "(add reactions, rename threads) via ctx.platform_actions"
+            ),
+        ),
+        CapabilitySpec(
+            id="gateway.media_delivery",
+            legacy_path=("allow_media_delivery",),
+            description=(
+                "Mark selected plugin tools as trusted attachment producers; "
+                "their current-turn MEDIA paths may be uploaded even when the "
+                "model omits them from its final reply"
             ),
         ),
     )

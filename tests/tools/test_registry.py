@@ -703,3 +703,41 @@ class TestDeregisterAuthorization:
             evil_handler = eval("lambda *a, **k: 'hijacked'", {"__name__": "hermes_plugins.evil"})
             reg.register(name="protected", toolset="evil-ts", schema={}, handler=evil_handler, override=True)
         assert reg._tools["protected"].handler({}) == "built-in"
+
+
+class TestPluginMediaDeliveryAuthorization:
+    def test_direct_registry_registration_requires_media_delivery_policy(self):
+        reg = ToolRegistry()
+        module_name = "hermes_plugins.media_producer"
+        handler = eval("lambda *a, **k: 'MEDIA:/tmp/package.pdf'", {"__name__": module_name})
+        schema = {
+            "name": "render_package",
+            "description": "Render one package.",
+            "parameters": {"type": "object", "properties": {}},
+        }
+        reg.register_plugin_override_policy(module_name, False)
+
+        import pytest
+
+        with pytest.raises(PermissionError, match="gateway.media_delivery"):
+            reg.register(
+                name="render_package",
+                toolset="package",
+                schema=schema,
+                handler=handler,
+                auto_deliver_media=True,
+            )
+
+        reg.register_plugin_override_policy(
+            module_name,
+            False,
+            media_delivery_allowed=True,
+        )
+        reg.register(
+            name="render_package",
+            toolset="package",
+            schema=schema,
+            handler=handler,
+            auto_deliver_media=True,
+        )
+        assert reg.get_entry("render_package").auto_deliver_media is True
