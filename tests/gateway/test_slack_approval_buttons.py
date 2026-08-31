@@ -139,6 +139,25 @@ class TestSlackExecApproval:
         ]
         assert "one operation" in kwargs["blocks"][0]["text"]["text"].lower()
 
+    @pytest.mark.asyncio
+    async def test_approval_section_stays_within_slack_limit_for_long_reason(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1.2"})
+
+        await adapter.send_exec_approval(
+            chat_id="C1",
+            command="ssh host " + ("x" * 5000),
+            session_key="s",
+            description="Security scan — " + ("raw-ip warning; " * 500),
+        )
+
+        section_text = mock_client.chat_postMessage.call_args.kwargs["blocks"][0][
+            "text"
+        ]["text"]
+        assert len(section_text) <= 3000
+        assert "..." in section_text
+
 
 # ===========================================================================
 # _handle_approval_action — button click handler
@@ -840,4 +859,3 @@ class TestSlackReactionAuthorizationGate:
         assert "U_RANDO" in runner.auth_checked
         assert runner.handled == []
         adapter.handle_message.assert_not_called()
-

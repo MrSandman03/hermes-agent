@@ -896,7 +896,8 @@ def _format_exec_approval_fallback(
     smart_denied: bool = False,
 ) -> str:
     """Render the text fallback from approval capabilities, not platform names."""
-    cmd_preview = command[:200] + "..." if len(command) > 200 else command
+    cmd_preview = command[:600] + "..." if len(command) > 600 else command
+    desc_preview = description[:1200] + "..." if len(description) > 1200 else description
     heading = "⚠️ **Dangerous command requires approval:**"
     if smart_denied:
         heading = "⚠️ **Smart DENY — owner override for one operation:**"
@@ -910,7 +911,7 @@ def _format_exec_approval_fallback(
             choices.append(f"`{command_prefix}approve always` to approve permanently")
     choices.append(f"`{command_prefix}deny` to cancel")
     return (
-        f"{heading}\n```\n{cmd_preview}\n```\nReason: {description}\n\n"
+        f"{heading}\n```\n{cmd_preview}\n```\nReason: {desc_preview}\n\n"
         + ", ".join(choices[:-1]) + f", or {choices[-1]}."
     )
 

@@ -125,6 +125,20 @@ class TestApprovalCommandWiring:
 
 
 class TestApprovalTextFallbackContract:
+    def test_long_command_and_reason_are_bounded(self):
+        from gateway.run import _format_exec_approval_fallback
+
+        text = _format_exec_approval_fallback(
+            "ssh host " + ("x" * 5000),
+            "raw-ip warning; " * 500,
+            "!",
+        )
+
+        assert len(text) < 2200
+        assert "..." in text
+        assert "`!approve`" in text
+        assert "`!deny`" in text
+
     def test_smart_deny_only_advertises_one_operation(self):
         from gateway.run import _format_exec_approval_fallback
 
@@ -137,4 +151,3 @@ class TestApprovalTextFallbackContract:
         assert "`/approve`" in text
         assert "approve session" not in text
         assert "approve always" not in text
-
