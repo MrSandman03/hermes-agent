@@ -3840,6 +3840,11 @@ class PluginManager:
         # full plugin loads.
         self._predeclared_modules: Dict[str, types.ModuleType] = {}
         self._predeclared_tools: Dict[str, List[str]] = {}
+        # Deferred client tools need the same profile-bound tool policy as a
+        # fully materialized plugin.  Keep the exact policy generation so the
+        # later adapter load reuses it instead of replacing (and potentially
+        # revoking) authority underneath the already-registered tools.
+        self._predeclared_tool_policies: Dict[str, Any] = {}
         # Native platform handler factories registered by plugins, keyed by
         # lowercase platform name. Each entry is (factory, plugin_name);
         # the platform's adapter invokes factories at connect() time with
@@ -4195,6 +4200,7 @@ class PluginManager:
             self._slack_action_handlers.clear()
             self._predeclared_modules.clear()
             self._predeclared_tools.clear()
+            self._predeclared_tool_policies.clear()
             self._platform_handler_factories.clear()
             self._context_engine = None
             with self._hook_timeout_lock:
@@ -4204,6 +4210,9 @@ class PluginManager:
         else:
             for key in target_keys:
                 self._plugins.pop(key, None)
+                self._predeclared_modules.pop(key, None)
+                self._predeclared_tools.pop(key, None)
+                self._predeclared_tool_policies.pop(key, None)
 
         return found
 
@@ -5080,7 +5089,9 @@ class PluginManager:
         # a partially-successful register_tools() left behind.
         before = set(self._plugin_tool_names)
         try:
-            module = self._load_directory_module(manifest)
+            module_name, policy = self._register_plugin_tool_policy(manifest)
+            self._predeclared_tool_policies[lookup_key] = policy
+            module = self._load_directory_module(manifest, module_name=module_name)
             # Record the module even if nothing below registers: the package
             # body has already run, so materializing the adapter later must
             # reuse it rather than execute it a second time.
@@ -5246,38 +5257,20 @@ class PluginManager:
             self._load_portable_plugin(manifest, loaded)
             return
 
-        from tools.registry import registry as _registry
         registration_start = len(self._registration_order)
         plugin_key = manifest.key or manifest.name
         _module_name = self._policy_module_name(manifest)
-        with replacement_coordinator.transaction():
-            policy_context = PluginContext(manifest, self)
-            previous_policy = _registry.snapshot_plugin_override_policy(
+        from tools.registry import registry as _registry
+
+        predeclared_policy = self._predeclared_tool_policies.pop(plugin_key, None)
+        if (
+            predeclared_policy is None
+            or _registry.snapshot_plugin_override_policy(
                 _module_name, scope=self.scope_key
             )
-            current_policy = _registry.register_plugin_override_policy(
-                _module_name,
-                policy_context._tool_override_allowed(""),
-                media_delivery_allowed=policy_context.has_capability("gateway.media_delivery"),
-                scope=self.scope_key,
-            )
-            policy_lease = replacement_coordinator.acquire(
-                ("tool_override_policy", self.scope_key, _module_name),
-                current=current_policy,
-                previous=previous_policy,
-                restore=lambda replacement: _registry.restore_plugin_override_policy(
-                    _module_name,
-                    current_policy,
-                    replacement,
-                    scope=self.scope_key,
-                ),
-            )
-            self._track_registration(
-                manifest,
-                "tool_override_policy",
-                _module_name,
-                policy_lease.dispose,
-            )
+            is not predeclared_policy
+        ):
+            self._register_plugin_tool_policy(manifest)
         try:
             # A deferred platform whose client tools were already registered at
             # discovery time has its package imported too — reuse it so the
@@ -5459,6 +5452,52 @@ class PluginManager:
             if module_name:
                 return module_name
         return self._directory_module_name(manifest)
+
+    def _register_plugin_tool_policy(
+        self,
+        manifest: PluginManifest,
+    ) -> tuple[str, Any]:
+        """Install one lifecycle-owned, profile-bound tool policy generation.
+
+        Deferred platform client tools register before their adapter is
+        materialized, so their module namespace must be bound before the first
+        ``ctx.register_tool`` call.  Eager loading uses this same helper; a
+        deferred load retains and reuses the returned generation.
+        """
+        from tools.registry import registry
+
+        module_name = self._policy_module_name(manifest)
+        with replacement_coordinator.transaction():
+            policy_context = PluginContext(manifest, self)
+            previous_policy = registry.snapshot_plugin_override_policy(
+                module_name, scope=self.scope_key
+            )
+            current_policy = registry.register_plugin_override_policy(
+                module_name,
+                policy_context._tool_override_allowed(""),
+                media_delivery_allowed=policy_context.has_capability(
+                    "gateway.media_delivery"
+                ),
+                scope=self.scope_key,
+            )
+            policy_lease = replacement_coordinator.acquire(
+                ("tool_override_policy", self.scope_key, module_name),
+                current=current_policy,
+                previous=previous_policy,
+                restore=lambda replacement: registry.restore_plugin_override_policy(
+                    module_name,
+                    current_policy,
+                    replacement,
+                    scope=self.scope_key,
+                ),
+            )
+            self._track_registration(
+                manifest,
+                "tool_override_policy",
+                module_name,
+                policy_lease.dispose,
+            )
+        return module_name, current_policy
 
     def _load_directory_module(
         self,
