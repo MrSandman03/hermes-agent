@@ -875,12 +875,18 @@ class ToolRegistry:
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
         """
+        caller_module = self._caller_module()
         if _plugin_policy is not None and _plugin_namespace is None:
             raise PermissionError(
                 "An explicit plugin policy requires its plugin namespace."
             )
+        if _plugin_namespace is not None and caller_module != "hermes_cli.plugins":
+            raise PermissionError(
+                "Explicit plugin policy bindings may only be supplied by the "
+                "plugin host."
+            )
         handler_owner = self._plugin_owner_of(handler)
-        caller_owner = self._plugin_namespace_of_module(self._caller_module())
+        caller_owner = self._plugin_namespace_of_module(caller_module)
         owner = _plugin_namespace or caller_owner or handler_owner
         if owner is not None:
             bound_scope = self._plugin_scope_of(owner)
