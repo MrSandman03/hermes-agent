@@ -808,3 +808,46 @@ class TestPluginMediaDeliveryAuthorization:
         assert reg.snapshot_registration(
             "render_package", scope="/profiles/b"
         ) is None
+
+    def test_profile_media_policy_never_falls_back_to_global_consent(self):
+        import pytest
+
+        reg = ToolRegistry()
+        module_name = "hermes_plugins.media_producer"
+        handler = eval(
+            "lambda *a, **k: 'MEDIA:/tmp/package.pdf'",
+            {"__name__": module_name},
+        )
+        reg.register_plugin_override_policy(
+            module_name,
+            False,
+            media_delivery_allowed=True,
+        )
+        local_policy = reg.register_plugin_override_policy(
+            module_name,
+            False,
+            media_delivery_allowed=False,
+            scope="/profiles/a",
+        )
+        assert reg.restore_plugin_override_policy(
+            module_name,
+            local_policy,
+            None,
+            scope="/profiles/a",
+        ) is True
+
+        with (
+            patch.object(ToolRegistry, "current_scope_key", return_value="/profiles/a"),
+            pytest.raises(PermissionError, match="gateway.media_delivery"),
+        ):
+            reg.register(
+                name="render_package",
+                toolset="package",
+                schema=_make_schema("render_package"),
+                handler=handler,
+                auto_deliver_media=True,
+            )
+
+        assert reg.snapshot_registration(
+            "render_package", scope="/profiles/a"
+        ) is None

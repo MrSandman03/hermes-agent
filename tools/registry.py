@@ -698,9 +698,11 @@ class ToolRegistry:
         self,
         scope: Optional[str],
         module_namespace: str,
+        *,
+        allow_global_fallback: bool = True,
     ) -> Optional[_PluginOverridePolicy]:
         policy = self._plugin_override_policy.get((scope, module_namespace))
-        if policy is None and scope is not None:
+        if policy is None and scope is not None and allow_global_fallback:
             policy = self._plugin_override_policy.get((None, module_namespace))
         return policy
 
@@ -717,7 +719,11 @@ class ToolRegistry:
         scope: Optional[str],
         module_namespace: str,
     ) -> bool:
-        policy = self._plugin_policy(scope, module_namespace)
+        policy = self._plugin_policy(
+            scope,
+            module_namespace,
+            allow_global_fallback=False,
+        )
         return bool(policy and policy.media_delivery_allowed)
 
     def entry_auto_delivers_media(self, entry: ToolEntry) -> bool:
@@ -879,7 +885,11 @@ class ToolRegistry:
             scope = bound_scope
         with self._lock:
             media_policy = (
-                self._plugin_policy(scope, owner)
+                self._plugin_policy(
+                    scope,
+                    owner,
+                    allow_global_fallback=False,
+                )
                 if auto_deliver_media and owner is not None
                 else None
             )

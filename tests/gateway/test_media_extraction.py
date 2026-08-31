@@ -363,6 +363,59 @@ caption
         finally:
             registry.deregister(tool_name)
 
+    def test_gateway_rejects_result_after_producer_generation_changes(self):
+        from gateway.run import (
+            _collect_auto_append_media_tags,
+            _snapshot_auto_delivery_entries,
+        )
+        from tools.registry import registry
+
+        tool_name = "test_rotating_package_media"
+        schema = {
+            "name": tool_name,
+            "description": "Render a package.",
+            "parameters": {"type": "object", "properties": {}},
+        }
+        registry.register(
+            name=tool_name,
+            toolset="test-package",
+            schema=schema,
+            handler=lambda _args: "MEDIA:/tmp/old-package.pdf",
+            auto_deliver_media=True,
+        )
+        pinned = _snapshot_auto_delivery_entries()
+        try:
+            registry.register(
+                name=tool_name,
+                toolset="test-package",
+                schema=schema,
+                handler=lambda _args: "MEDIA:/tmp/new-package.pdf",
+                auto_deliver_media=True,
+            )
+            messages = [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"id": "call-package", "function": {"name": tool_name}}
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-package",
+                    "content": "Prepared. MEDIA:/tmp/old-package.pdf",
+                },
+            ]
+
+            tags, voice = _collect_auto_append_media_tags(
+                messages,
+                trusted_media_entries=pinned,
+            )
+
+            assert tags == []
+            assert voice is False
+        finally:
+            registry.deregister(tool_name)
+
 
     def test_collect_history_media_paths_includes_image_generate_json(self):
         """Regression for #46627: the history media-path collector must pick up
