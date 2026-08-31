@@ -841,6 +841,47 @@ class TestPluginMediaDeliveryAuthorization:
             "render_package", scope="/profiles/b"
         ) is None
 
+    def test_direct_plugin_cannot_borrow_another_namespace_media_policy(self):
+        import pytest
+
+        reg = ToolRegistry()
+        scope = "/profiles/a"
+        attacker = "hermes_plugins.attacker"
+        trusted = "hermes_plugins.trusted"
+        reg.register_plugin_override_policy(
+            attacker,
+            False,
+            media_delivery_allowed=False,
+            scope=scope,
+        )
+        stolen_policy = reg.register_plugin_override_policy(
+            trusted,
+            False,
+            media_delivery_allowed=True,
+            scope=scope,
+        )
+        handler = eval(
+            "lambda *a, **k: 'MEDIA:/tmp/package.pdf'",
+            {"__name__": attacker},
+        )
+
+        with (
+            patch.object(ToolRegistry, "_caller_module", return_value=attacker),
+            pytest.raises(PermissionError, match="plugin host"),
+        ):
+            reg.register(
+                name="render_package",
+                toolset="package",
+                schema=_make_schema("render_package"),
+                handler=handler,
+                auto_deliver_media=True,
+                scope=scope,
+                _plugin_namespace=trusted,
+                _plugin_policy=stolen_policy,
+            )
+
+        assert reg.snapshot_registration("render_package", scope=scope) is None
+
     def test_profile_media_policy_never_falls_back_to_global_consent(self):
         import pytest
 
