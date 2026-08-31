@@ -741,3 +741,70 @@ class TestPluginMediaDeliveryAuthorization:
             auto_deliver_media=True,
         )
         assert reg.get_entry("render_package").auto_deliver_media is True
+
+    def test_policy_revocation_removes_direct_media_registration(self):
+        reg = ToolRegistry()
+        module_name = "hermes_plugins.media_producer"
+        handler = eval(
+            "lambda *a, **k: 'MEDIA:/tmp/package.pdf'",
+            {"__name__": module_name},
+        )
+        policy = reg.register_plugin_override_policy(
+            module_name,
+            False,
+            media_delivery_allowed=True,
+        )
+        reg.register(
+            name="render_package",
+            toolset="package",
+            schema=_make_schema("render_package"),
+            handler=handler,
+            auto_deliver_media=True,
+        )
+        entry = reg.get_entry("render_package")
+        assert entry is not None
+        assert reg.entry_auto_delivers_media(entry) is True
+
+        assert reg.restore_plugin_override_policy(module_name, policy, None) is True
+
+        assert reg.snapshot_registration("render_package") is None
+        assert reg.entry_auto_delivers_media(entry) is False
+
+    def test_direct_plugin_registration_cannot_borrow_another_profile_scope(self):
+        import pytest
+
+        reg = ToolRegistry()
+        module_name = "hermes_plugins.media_producer"
+        handler = eval(
+            "lambda *a, **k: 'MEDIA:/tmp/package.pdf'",
+            {"__name__": module_name},
+        )
+        reg.register_plugin_override_policy(
+            module_name,
+            False,
+            media_delivery_allowed=False,
+            scope="/profiles/a",
+        )
+        reg.register_plugin_override_policy(
+            module_name,
+            False,
+            media_delivery_allowed=True,
+            scope="/profiles/b",
+        )
+
+        with (
+            patch.object(ToolRegistry, "current_scope_key", return_value="/profiles/a"),
+            pytest.raises(PermissionError, match="immutable scope"),
+        ):
+            reg.register(
+                name="render_package",
+                toolset="package",
+                schema=_make_schema("render_package"),
+                handler=handler,
+                auto_deliver_media=True,
+                scope="/profiles/b",
+            )
+
+        assert reg.snapshot_registration(
+            "render_package", scope="/profiles/b"
+        ) is None

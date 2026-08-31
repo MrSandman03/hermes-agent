@@ -2019,7 +2019,7 @@ def _tool_auto_delivers_media(tool_name: str) -> bool:
         entry = registry.get_entry(tool_name)
     except Exception:
         return False
-    return bool(entry is not None and entry.auto_deliver_media)
+    return bool(entry is not None and registry.entry_auto_delivers_media(entry))
 
 # ---- helpers: detect interrupted tool tails & auto-continue noise ----------
 

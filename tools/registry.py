@@ -208,13 +208,13 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
-        "auto_deliver_media",
+        "auto_deliver_media", "_media_delivery_policy",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
                  max_result_size_chars=None, dynamic_schema_overrides=None,
-                 auto_deliver_media=False):
+                 auto_deliver_media=False, media_delivery_policy=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -236,6 +236,11 @@ class ToolEntry:
         # Trusted producer contract: the gateway may recover MEDIA directives
         # from this tool's current-turn result when the model omits them.
         self.auto_deliver_media = bool(auto_deliver_media)
+        # Plugin media authority is generation-bound. Core/built-in producers
+        # have no policy object; plugin producers retain the exact policy
+        # identity that authorized their registration so revocation can fail
+        # closed even if a plugin bypasses PluginContext's ownership ledger.
+        self._media_delivery_policy = media_delivery_policy
 
 
 class _PluginOverridePolicy:
@@ -470,6 +475,14 @@ class ToolRegistry:
         self._plugin_override_policy: Dict[
             tuple[Optional[str], str], _PluginOverridePolicy
         ] = {}
+        # Direct ``registry.register(auto_deliver_media=True)`` calls do not
+        # pass through PluginContext's ownership ledger. Keep narrow,
+        # identity-conditional inverses under the authorizing policy so a
+        # policy unload/reload also revokes those registrations.
+        self._plugin_media_registrations: Dict[
+            _PluginOverridePolicy,
+            List[tuple[Optional[str], str, ToolEntry, Optional[ToolEntry]]],
+        ] = {}
         # Scope attribution stays durable after policy removal so delayed code
         # remains confined to the profile where its module was loaded.
         self._plugin_module_scopes: Dict[str, Set[Optional[str]]] = {}
@@ -615,6 +628,9 @@ class ToolRegistry:
         authorization without losing durable module-to-profile attribution.
         """
         with self._lock:
+            previous = self._plugin_override_policy.get((scope, module_namespace))
+            if previous is not None:
+                self._revoke_plugin_media_registrations(previous)
             policy = _PluginOverridePolicy(
                 allowed,
                 media_delivery_allowed=media_delivery_allowed,
@@ -646,20 +662,54 @@ class ToolRegistry:
             key = (scope, module_namespace)
             if self._plugin_override_policy.get(key) is not current:
                 return False
+            self._revoke_plugin_media_registrations(current)
             if previous is None:
                 self._plugin_override_policy.pop(key, None)
             else:
                 self._plugin_override_policy[key] = previous
             return True
 
+    def _revoke_plugin_media_registrations(
+        self,
+        policy: _PluginOverridePolicy,
+    ) -> None:
+        """CAS-restore media tools authorized by one policy generation."""
+        registrations = self._plugin_media_registrations.pop(policy, [])
+        changed = False
+        for scope, name, current, previous in reversed(registrations):
+            target = (
+                self._tools
+                if scope is None
+                else self._scoped_tools.get(scope, {})
+            )
+            if target.get(name) is not current:
+                continue
+            if previous is None:
+                target.pop(name, None)
+            else:
+                target[name] = previous
+            if scope is not None and not target:
+                self._scoped_tools.pop(scope, None)
+            changed = True
+        if changed:
+            self._generation += 1
+
+    def _plugin_policy(
+        self,
+        scope: Optional[str],
+        module_namespace: str,
+    ) -> Optional[_PluginOverridePolicy]:
+        policy = self._plugin_override_policy.get((scope, module_namespace))
+        if policy is None and scope is not None:
+            policy = self._plugin_override_policy.get((None, module_namespace))
+        return policy
+
     def _plugin_override_allowed(
         self,
         scope: Optional[str],
         module_namespace: str,
     ) -> bool:
-        policy = self._plugin_override_policy.get((scope, module_namespace))
-        if policy is None and scope is not None:
-            policy = self._plugin_override_policy.get((None, module_namespace))
+        policy = self._plugin_policy(scope, module_namespace)
         return bool(policy and policy.allowed)
 
     def _plugin_media_delivery_allowed(
@@ -667,10 +717,21 @@ class ToolRegistry:
         scope: Optional[str],
         module_namespace: str,
     ) -> bool:
-        policy = self._plugin_override_policy.get((scope, module_namespace))
-        if policy is None and scope is not None:
-            policy = self._plugin_override_policy.get((None, module_namespace))
+        policy = self._plugin_policy(scope, module_namespace)
         return bool(policy and policy.media_delivery_allowed)
+
+    def entry_auto_delivers_media(self, entry: ToolEntry) -> bool:
+        """Return whether an entry still has live trusted-media authority."""
+        if not entry.auto_deliver_media:
+            return False
+        policy = entry._media_delivery_policy
+        if policy is None:
+            return True
+        with self._lock:
+            return bool(
+                policy.media_delivery_allowed
+                and policy in self._plugin_override_policy.values()
+            )
 
     def _plugin_owner_of(self, handler: Callable) -> Optional[str]:
         """Return the plugin module namespace that defined *handler*, or None
@@ -808,13 +869,24 @@ class ToolRegistry:
         handler_owner = self._plugin_owner_of(handler)
         caller_owner = self._plugin_namespace_of_module(self._caller_module())
         owner = caller_owner or handler_owner
-        if scope is None and owner is not None:
-            scope = self._plugin_scope_of(owner)
+        if owner is not None:
+            bound_scope = self._plugin_scope_of(owner)
+            if scope is not None and scope != bound_scope:
+                raise PermissionError(
+                    f"Plugin module {owner!r} cannot register a tool in profile "
+                    f"scope {scope!r}; its active immutable scope is {bound_scope!r}."
+                )
+            scope = bound_scope
         with self._lock:
+            media_policy = (
+                self._plugin_policy(scope, owner)
+                if auto_deliver_media and owner is not None
+                else None
+            )
             if (
                 auto_deliver_media
                 and owner is not None
-                and not self._plugin_media_delivery_allowed(scope, owner)
+                and not (media_policy and media_policy.media_delivery_allowed)
             ):
                 raise PermissionError(
                     f"Plugin module {owner!r} cannot register a trusted media "
@@ -888,7 +960,8 @@ class ToolRegistry:
                         name, toolset, existing.toolset,
                     )
                     return
-            target[name] = ToolEntry(
+            previous = target.get(name)
+            registered = ToolEntry(
                 name=name,
                 toolset=toolset,
                 schema=schema,
@@ -901,7 +974,13 @@ class ToolRegistry:
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
                 auto_deliver_media=auto_deliver_media,
+                media_delivery_policy=media_policy,
             )
+            target[name] = registered
+            if media_policy is not None:
+                self._plugin_media_registrations.setdefault(media_policy, []).append(
+                    (scope, name, registered, previous)
+                )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
             # get_toolset_requirements -> TOOLSET_REQUIREMENTS["check_fn"], which
