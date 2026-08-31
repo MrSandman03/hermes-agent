@@ -1791,8 +1791,9 @@ class PluginContext:
         is_async: bool = False,
         description: str = "",
         emoji: str = "",
-        auto_deliver_media: bool = False,
         override: bool = False,
+        *,
+        auto_deliver_media: bool = False,
     ) -> Optional[PluginRegistration]:
         """Register a tool in the global registry **and** track it as plugin-provided.
 
