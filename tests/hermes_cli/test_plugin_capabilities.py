@@ -391,12 +391,15 @@ class TestLegacyGateCompat:
             "forged", ["gateway.media_delivery"], ["gateway.media_delivery"]
         )
         module_name = manager._policy_module_name(manifest)
-        policy = registry.register_plugin_override_policy(
-            module_name,
-            False,
-            media_delivery_allowed=True,
-            scope=manager.scope_key,
-        )
+        with patch.object(
+            type(registry), "_caller_module", return_value="hermes_cli.plugins"
+        ):
+            policy = registry.register_plugin_override_policy(
+                module_name,
+                False,
+                media_delivery_allowed=True,
+                scope=manager.scope_key,
+            )
         forged = PluginContext(manifest, manager)
         forged._tool_policy_namespace = module_name
         forged._tool_policy = policy
@@ -416,12 +419,15 @@ class TestLegacyGateCompat:
                 "forged_render_package", scope=manager.scope_key
             ) is None
         finally:
-            registry.restore_plugin_override_policy(
-                module_name,
-                policy,
-                None,
-                scope=manager.scope_key,
-            )
+            with patch.object(
+                type(registry), "_caller_module", return_value="hermes_cli.plugins"
+            ):
+                registry.restore_plugin_override_policy(
+                    module_name,
+                    policy,
+                    None,
+                    scope=manager.scope_key,
+                )
 
     def test_loaded_context_cannot_borrow_another_plugin_media_policy(
         self, hermes_home, tmp_path
@@ -535,12 +541,15 @@ class TestLegacyGateCompat:
         assert entry is not None
         assert entry._media_delivery_policy is policy
 
-        replacement = registry.register_plugin_override_policy(
-            module_name,
-            False,
-            media_delivery_allowed=False,
-            scope=manager.scope_key,
-        )
+        with patch.object(
+            type(registry), "_caller_module", return_value="hermes_cli.plugins"
+        ):
+            replacement = registry.register_plugin_override_policy(
+                module_name,
+                False,
+                media_delivery_allowed=False,
+                scope=manager.scope_key,
+            )
         try:
             assert registry.snapshot_registration(
                 "importplug_render_package", scope=manager.scope_key
@@ -558,12 +567,15 @@ class TestLegacyGateCompat:
                     auto_deliver_media=True,
                 )
         finally:
-            registry.restore_plugin_override_policy(
-                module_name,
-                replacement,
-                policy,
-                scope=manager.scope_key,
-            )
+            with patch.object(
+                type(registry), "_caller_module", return_value="hermes_cli.plugins"
+            ):
+                registry.restore_plugin_override_policy(
+                    module_name,
+                    replacement,
+                    policy,
+                    scope=manager.scope_key,
+                )
             manager.unload(manifest)
 
     def test_bundled_plugin_trusted(self, hermes_home):
