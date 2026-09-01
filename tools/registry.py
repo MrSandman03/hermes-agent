@@ -481,10 +481,8 @@ class ToolRegistry:
         self._plugin_override_policy: Dict[
             tuple[Optional[str], str], _PluginOverridePolicy
         ] = {}
-        # Direct ``registry.register(auto_deliver_media=True)`` calls do not
-        # pass through PluginContext's ownership ledger. Keep narrow,
-        # identity-conditional inverses under the authorizing policy so a
-        # policy unload/reload also revokes those registrations.
+        # Keep identity-conditional inverses under the authorizing policy so a
+        # policy unload/reload also revokes trusted-media registrations.
         self._plugin_media_registrations: Dict[
             _PluginOverridePolicy,
             List[tuple[Optional[str], str, ToolEntry, Optional[ToolEntry]]],
@@ -793,7 +791,7 @@ class ToolRegistry:
             return False
         policy = entry._media_delivery_policy
         if policy is None:
-            return True
+            return False
         with self._lock:
             return bool(
                 policy.media_delivery_allowed
@@ -976,6 +974,10 @@ class ToolRegistry:
         handler_owner = self._plugin_owner_of(handler)
         caller_owner = self._plugin_namespace_of_module(caller_module)
         owner = _plugin_namespace or caller_owner or handler_owner
+        if auto_deliver_media and owner is None:
+            raise PermissionError(
+                "Trusted media registration requires host-bound plugin authority."
+            )
         if owner is not None:
             bound_scope = self._plugin_scope_of(owner)
             if scope is not None and scope != bound_scope:
