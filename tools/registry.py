@@ -573,11 +573,23 @@ class ToolRegistry:
         def host_registration_frame(frame) -> bool:
             module_name = frame.f_globals.get("__name__", "")
             module = sys.modules.get(module_name)
-            return (
-                module_name.startswith("tools.")
-                and module is not None
-                and module.__dict__ is frame.f_globals
-            )
+            if (
+                not module_name.startswith("tools.")
+                or module is None
+                or module.__dict__ is not frame.f_globals
+            ):
+                return False
+            # ``exec(..., vars(tools_module))`` can impersonate a module's
+            # globals, but its code object still carries the exec filename.
+            module_file = getattr(module, "__file__", None)
+            if not module_file:
+                return False
+            try:
+                return Path(frame.f_code.co_filename).resolve() == Path(
+                    module_file
+                ).resolve()
+            except (OSError, RuntimeError):
+                return False
 
         def mark_host_entry(entry: ToolEntry) -> None:
             try:
@@ -592,6 +604,9 @@ class ToolRegistry:
 
         self._host_entry_marker = mark_host_entry
         self._host_entry_verifier = is_host_entry
+        # Bind the public query per instance so replacing the class method
+        # cannot bypass this registry's closure-backed provenance set.
+        self.entry_is_host_registered = is_host_entry
         self._host_caller_verifier = host_caller_allowed
         self._host_registration_verifier = host_registration_frame
         self._toolset_aliases: Dict[str, str] = {}
@@ -610,6 +625,7 @@ class ToolRegistry:
         if name in {
             "_host_entry_marker",
             "_host_entry_verifier",
+            "entry_is_host_registered",
             "_host_caller_verifier",
             "_host_registration_verifier",
         } and name in self.__dict__:

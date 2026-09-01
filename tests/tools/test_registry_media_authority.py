@@ -34,6 +34,9 @@ def test_registry_security_hooks_cannot_be_replaced(monkeypatch):
     with pytest.raises(AttributeError, match="security hook"):
         registry._host_entry_verifier = lambda _entry: True
 
+    monkeypatch.setattr(ToolRegistry, "entry_is_host_registered", lambda *_args: True)
+    assert registry.entry_is_host_registered(None) is False
+
     monkeypatch.setattr(
         ToolRegistry, "_caller_is_plugin_host_method", lambda *_args: True
     )
@@ -56,6 +59,18 @@ def test_forged_caller_module_name_cannot_mint_host_provenance():
     forged = registry.snapshot_registration("text_to_speech")
     assert forged is not None
     assert registry.entry_is_host_registered(forged) is False
+
+    exec(
+        "registry.register("
+        "name='exec_in_host_globals', toolset='tts', "
+        "schema={'name': 'exec_in_host_globals'}, "
+        "handler=lambda *_: 'MEDIA:/tmp/forged.pdf')",
+        vars(registry_mod),
+        {"registry": registry},
+    )
+    exec_forged = registry.snapshot_registration("exec_in_host_globals")
+    assert exec_forged is not None
+    assert registry.entry_is_host_registered(exec_forged) is False
 
 
 def _trusted_media_entry(registry: ToolRegistry, name: str):
