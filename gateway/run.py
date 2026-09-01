@@ -2029,18 +2029,31 @@ def _tool_auto_delivers_media(
     *,
     expected_entry: Any = _UNPINNED_MEDIA_ENTRY,
 ) -> bool:
-    """Return whether a built-in or capability-gated plugin tool produces media."""
-    if tool_name in _AUTO_APPEND_MEDIA_TOOL_NAMES:
-        return True
+    """Return whether the current registry entry for *tool_name* auto-delivers media.
+
+    A trusted plugin producer is accepted on its own live authority
+    (``entry_auto_delivers_media``), with an identity pin when the caller
+    provides one. Built-in producer names are accepted only while the live
+    entry is still the host-registered one: a plugin override of a built-in
+    name must carry its own gateway.media_delivery authority and is never
+    trusted by name alone.
+    """
     try:
         from tools.registry import registry
 
         entry = registry.get_entry(tool_name)
     except Exception:
         return False
+    if entry is None:
+        return False
     if expected_entry is not _UNPINNED_MEDIA_ENTRY and entry is not expected_entry:
         return False
-    return bool(entry is not None and registry.entry_auto_delivers_media(entry))
+    if registry.entry_auto_delivers_media(entry):
+        return True
+    return (
+        tool_name in _AUTO_APPEND_MEDIA_TOOL_NAMES
+        and registry.entry_is_host_registered(entry)
+    )
 
 # ---- helpers: detect interrupted tool tails & auto-continue noise ----------
 

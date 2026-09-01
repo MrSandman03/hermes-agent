@@ -871,6 +871,18 @@ class ToolRegistry:
                 return target.get(name) is entry
             return False
 
+    def entry_is_host_registered(self, entry: Optional[ToolEntry]) -> bool:
+        """Return whether an entry's handler is defined outside plugin modules.
+
+        Built-in and MCP handlers are defined in host modules; a plugin that
+        overrides a built-in name registers a handler defined in its own
+        module, so the original host implementation stays distinguishable
+        from any replacement by where the handler was DEFINED.
+        """
+        if entry is None:
+            return False
+        return self._plugin_owner_of(entry.handler) is None
+
     def _plugin_owner_of(self, handler: Callable) -> Optional[str]:
         """Return the plugin module namespace that defined *handler*, or None
         if it was not defined in a loaded plugin module.

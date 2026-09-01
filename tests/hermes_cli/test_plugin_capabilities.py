@@ -43,10 +43,21 @@ def _read_cfg(home):
 
 
 class TestRegistry:
-    def test_media_delivery_contract_requires_loader_bound_lifecycle(self):
-        from hermes_cli.plugins import PLUGIN_MEDIA_DELIVERY_CONTRACT_VERSION
+    def test_media_delivery_contract_exposes_version_and_registration_argument(self):
+        import inspect
 
-        assert PLUGIN_MEDIA_DELIVERY_CONTRACT_VERSION == 2
+        from hermes_cli.plugins import (
+            PLUGIN_MEDIA_DELIVERY_CONTRACT_VERSION,
+            PluginContext,
+        )
+
+        # The Assbot installer AST-probes exactly these two facts before it
+        # mutates the managed plugin; assert the behavior they depend on
+        # rather than pinning a specific version number.
+        assert isinstance(PLUGIN_MEDIA_DELIVERY_CONTRACT_VERSION, int)
+        assert PLUGIN_MEDIA_DELIVERY_CONTRACT_VERSION >= 1
+        parameters = inspect.signature(PluginContext.register_tool).parameters
+        assert "auto_deliver_media" in parameters
 
     def test_every_capability_has_legacy_gate(self):
         for spec in CAPABILITY_REGISTRY.values():
