@@ -247,6 +247,9 @@ def _save_discovery_cache(cache: Dict[str, list]) -> None:
         logger.debug("Could not write tool discovery cache %s: %s", path, e)
 
 
+_UNSET_REGISTRATION_OWNER = object()
+
+
 class ToolEntry:
     """Metadata for a single registered tool."""
 
@@ -254,13 +257,15 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
-        "auto_deliver_media", "_media_delivery_policy", "_sealed",
+        "auto_deliver_media", "_media_delivery_policy", "_registration_owner",
+        "_sealed",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
                  max_result_size_chars=None, dynamic_schema_overrides=None,
-                 auto_deliver_media=False, media_delivery_policy=None):
+                 auto_deliver_media=False, media_delivery_policy=None,
+                 registration_owner=_UNSET_REGISTRATION_OWNER):
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "toolset", toolset)
         object.__setattr__(self, "schema", schema)
@@ -287,6 +292,10 @@ class ToolEntry:
         # identity that authorized their registration so revocation can fail
         # closed even if a plugin bypasses PluginContext's ownership ledger.
         object.__setattr__(self, "_media_delivery_policy", media_delivery_policy)
+        # Record the registration owner independently of the callable's
+        # defining module. A plugin can intentionally register a host-defined
+        # callable, so callable provenance alone is not an authority check.
+        object.__setattr__(self, "_registration_owner", registration_owner)
         object.__setattr__(self, "_sealed", True)
 
     def __setattr__(self, name, value):
@@ -881,7 +890,7 @@ class ToolRegistry:
         """
         if entry is None:
             return False
-        return self._plugin_owner_of(entry.handler) is None
+        return entry._registration_owner is None
 
     def _plugin_owner_of(self, handler: Callable) -> Optional[str]:
         """Return the plugin module namespace that defined *handler*, or None
@@ -1188,6 +1197,7 @@ class ToolRegistry:
                 dynamic_schema_overrides=dynamic_schema_overrides,
                 auto_deliver_media=auto_deliver_media,
                 media_delivery_policy=media_policy,
+                registration_owner=owner,
             )
             target[name] = registered
             if media_policy is not None:
