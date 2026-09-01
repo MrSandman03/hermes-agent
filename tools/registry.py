@@ -602,11 +602,37 @@ class ToolRegistry:
         def is_host_entry(entry: ToolEntry) -> bool:
             return entry in host_entries
 
+        def is_auto_media_entry(entry: ToolEntry) -> bool:
+            if not entry.auto_deliver_media:
+                return False
+            policy = entry._media_delivery_policy
+            if policy is None:
+                return False
+            with self._lock:
+                if (
+                    not policy.media_delivery_allowed
+                    or policy not in self._plugin_override_policy.values()
+                ):
+                    return False
+                for scope, name, current, _previous in (
+                    self._plugin_media_registrations.get(policy, ())
+                ):
+                    if current is not entry:
+                        continue
+                    target = (
+                        self._tools
+                        if scope is None
+                        else self._scoped_tools.get(scope, {})
+                    )
+                    return target.get(name) is entry
+                return False
+
         self._host_entry_marker = mark_host_entry
         self._host_entry_verifier = is_host_entry
         # Bind the public query per instance so replacing the class method
         # cannot bypass this registry's closure-backed provenance set.
         self.entry_is_host_registered = is_host_entry
+        self.entry_auto_delivers_media = is_auto_media_entry
         self._host_caller_verifier = host_caller_allowed
         self._host_registration_verifier = host_registration_frame
         self._toolset_aliases: Dict[str, str] = {}
@@ -626,6 +652,7 @@ class ToolRegistry:
             "_host_entry_marker",
             "_host_entry_verifier",
             "entry_is_host_registered",
+            "entry_auto_delivers_media",
             "_host_caller_verifier",
             "_host_registration_verifier",
         } and name in self.__dict__:

@@ -33,9 +33,15 @@ def test_registry_security_hooks_cannot_be_replaced(monkeypatch):
     registry = ToolRegistry()
     with pytest.raises(AttributeError, match="security hook"):
         registry._host_entry_verifier = lambda _entry: True
+    with pytest.raises(AttributeError, match="security hook"):
+        registry.entry_auto_delivers_media = lambda _entry: True
 
     monkeypatch.setattr(ToolRegistry, "entry_is_host_registered", lambda *_args: True)
     assert registry.entry_is_host_registered(None) is False
+    monkeypatch.setattr(ToolRegistry, "entry_auto_delivers_media", lambda *_args: True)
+    assert registry.entry_auto_delivers_media(
+        ToolEntry("forged", "forged", {}, lambda: "", None, [], False, "", "")
+    ) is False
 
     monkeypatch.setattr(
         ToolRegistry, "_caller_is_plugin_host_method", lambda *_args: True
