@@ -17,7 +17,7 @@ def _host_register_plugin_policy(registry, *args, **kwargs):
     from tools.registry import ToolRegistry
 
     with patch.object(
-        ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
+        ToolRegistry, "_caller_is_plugin_host_method", return_value=True
     ):
         return registry.register_plugin_override_policy(*args, **kwargs)
 
@@ -28,7 +28,7 @@ def _host_restore_plugin_policy(registry, *args, **kwargs):
     from tools.registry import ToolRegistry
 
     with patch.object(
-        ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
+        ToolRegistry, "_caller_is_plugin_host_method", return_value=True
     ):
         return registry.restore_plugin_override_policy(*args, **kwargs)
 
@@ -38,17 +38,27 @@ def _host_bind_plugin_context(registry, namespace, policy, *, scope):
 
     from tools.registry import ToolRegistry
 
-    class _Context:
-        pass
-
-    context = _Context()
     with patch.object(
-        ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
+        ToolRegistry, "_caller_is_plugin_host_method", return_value=True
     ):
-        registry._bind_plugin_registration_context(
-            context, namespace, policy, scope=scope
+        return registry._bind_plugin_registration_context(
+            namespace, policy, scope=scope
         )
-    return context
+
+
+def _host_prepare_tool_context(context) -> None:
+    from tools.registry import registry
+
+    manager = context._manager
+    namespace = manager._policy_module_name(context.manifest)
+    policy = _host_register_plugin_policy(
+        registry, namespace, False, scope=manager.scope_key
+    )
+    context._tool_policy_namespace = namespace
+    context._tool_policy = policy
+    context._tool_registration_permit = _host_bind_plugin_context(
+        registry, namespace, policy, scope=manager.scope_key
+    )
 
 
 def _write_plugin(hermes_home: Path) -> None:
@@ -312,6 +322,8 @@ def test_targeted_unload_does_not_resurrect_an_older_tool_override():
     manager_b = PluginManager(scope_key=scope)
     context_a = PluginContext(PluginManifest(name="tool_a", key="tool_a"), manager_a)
     context_b = PluginContext(PluginManifest(name="tool_b", key="tool_b"), manager_b)
+    _host_prepare_tool_context(context_a)
+    _host_prepare_tool_context(context_b)
 
     def register(context, marker):
         return context.register_tool(
@@ -435,6 +447,8 @@ def test_rejected_tool_registration_does_not_claim_local_predecessor():
     manager_b = PluginManager(scope_key=scope)
     context_a = PluginContext(PluginManifest(name="local_owner", key="local_owner"), manager_a)
     context_b = PluginContext(PluginManifest(name="false_owner", key="false_owner"), manager_b)
+    _host_prepare_tool_context(context_a)
+    _host_prepare_tool_context(context_b)
     try:
         assert context_a.register_tool(
             name=name,
@@ -480,18 +494,11 @@ def test_scoped_plugin_cannot_deregister_a_process_global_tool():
         registry,
         module_name, True, scope="/profiles/isolated"
     )
-    context = _host_bind_plugin_context(
-        registry,
-        module_name,
-        policy,
-        scope="/profiles/isolated",
-    )
-
     with patch.object(
-        ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
+        ToolRegistry, "_caller_module", return_value=module_name
     ):
-        with pytest.raises(PermissionError, match="process-global"):
-            registry.deregister(name, _plugin_context=context)
+        with pytest.raises(PermissionError, match="through the host registry"):
+            registry.deregister(name)
 
     assert registry.snapshot_registration(name) is not None
 
@@ -515,9 +522,6 @@ def test_shared_entrypoint_module_uses_the_active_profile_scope(tmp_path):
     policy_b = _host_register_plugin_policy(
         registry,
         module_name, False, scope=home_b
-    )
-    context_a = _host_bind_plugin_context(
-        registry, module_name, policy_a, scope=home_a
     )
     handler = eval("lambda args, **kwargs: 'shared'", {"__name__": module_name})
 
@@ -543,18 +547,11 @@ def test_shared_entrypoint_module_uses_the_active_profile_scope(tmp_path):
     assert registry.snapshot_registration("shared_entrypoint_b", scope=home_b) is not None
     assert registry.snapshot_registration("shared_entrypoint_b") is None
 
-    from unittest.mock import patch
-
-    token = set_hermes_home_override(home_a)
-    try:
-        with patch.object(
-            ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
-        ):
-            registry.deregister(
-                "shared_entrypoint_a", _plugin_context=context_a
-            )
-    finally:
-        reset_hermes_home_override(token)
+    entry_a = registry.snapshot_registration("shared_entrypoint_a", scope=home_a)
+    assert entry_a is not None
+    assert registry.restore_registration(
+        "shared_entrypoint_a", entry_a, None, scope=home_a
+    )
     assert registry.snapshot_registration("shared_entrypoint_a", scope=home_a) is None
     assert registry.snapshot_registration("shared_entrypoint_b", scope=home_b) is not None
 

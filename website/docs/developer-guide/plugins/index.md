@@ -512,6 +512,12 @@ def register(ctx):
 - `ctx.register_cli_command()` registers a CLI subcommand (e.g. `hermes my-plugin <subcommand>`)
 - `ctx.register_command()` registers an in-session slash command (e.g. `/myplugin <args>` inside CLI / gateway chat) — see [Register slash commands](#register-slash-commands) below
 - `ctx.dispatch_tool(name, arguments)` — call any other tool (built-in or from another plugin) with the parent agent's context (approvals, credentials, task_id) wired up automatically. Useful from slash-command handlers that need to invoke `terminal`, `read_file`, or any other tool as if the model had called it directly.
+
+Privileged registrations (`override=True` or `auto_deliver_media=True`) must be
+made by the plugin that received the context, from that plugin's loaded module
+or one of its submodules. Do not pass a `PluginContext` to another plugin or
+proxy privileged registration on its behalf; Hermes rejects that confused-
+deputy pattern even when the original plugin has operator consent.
 - `ctx.get_config()` / `ctx.set_config()` access only this plugin's settings namespace; `ctx.state` stores plugin-owned runtime data under the active profile.
 - If this function crashes, the plugin is disabled but Hermes continues fine
 

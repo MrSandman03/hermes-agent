@@ -32,14 +32,14 @@ def _make_schema(name="test_tool"):
 
 def _host_register_plugin_policy(registry, *args, **kwargs):
     with patch.object(
-        ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
+        ToolRegistry, "_caller_is_plugin_host_method", return_value=True
     ):
         return registry.register_plugin_override_policy(*args, **kwargs)
 
 
 def _host_restore_plugin_policy(registry, *args, **kwargs):
     with patch.object(
-        ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
+        ToolRegistry, "_caller_is_plugin_host_method", return_value=True
     ):
         return registry.restore_plugin_override_policy(*args, **kwargs)
 
@@ -623,7 +623,7 @@ class TestToolsetAvailabilityAggregation:
 
 
 class TestDeregisterAuthorization:
-    """deregister() must apply the same plugin opt-in gate as register().
+    """deregister() is a core lifecycle operation, never a plugin capability.
 
     A plugin could bypass register(override=True) authorization entirely by
     first calling deregister() to clear the existing entry — making
@@ -644,82 +644,56 @@ class TestDeregisterAuthorization:
 
     @staticmethod
     def _bound_context(reg, namespace, *, allowed):
-        class _Context:
-            pass
-
-        context = _Context()
         policy = _host_register_plugin_policy(reg, namespace, allowed)
         with patch.object(
-            ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
+            ToolRegistry, "_caller_is_plugin_host_method", return_value=True
         ):
-            reg._bind_plugin_registration_context(context, namespace, policy)
-        return context
+            return reg._bind_plugin_registration_context(namespace, policy)
 
     def test_plugin_cannot_deregister_unowned_tool_without_opt_in(self):
         reg = self._reg()
         _host_register_plugin_policy(reg, "hermes_plugins.evil", False)
         with patch.object(ToolRegistry, "_caller_module", return_value="hermes_plugins.evil"):
-            with pytest.raises(PermissionError, match="host-bound PluginContext"):
+            with pytest.raises(PermissionError, match="through the host registry"):
                 reg.deregister("protected")
         assert reg._tools.get("protected") is not None, "tool must survive the rejected deregister"
 
 
-    def test_plugin_root_module_can_deregister_submodule_handler(self):
-        """Plugin root cleaning up a tool whose handler lives in a submodule.
-
-        hermes_plugins.pkg (root cleanup code) must be allowed to deregister a
-        tool whose handler was defined in hermes_plugins.pkg.handlers.  The
-        exact module strings differ, but they share the same plugin package root
-        (hermes_plugins.pkg) — ownership is bound to the package, not the leaf
-        module (egilewski review, #55840).
-        """
+    def test_plugin_root_cannot_deregister_its_submodule_handler(self):
         reg = ToolRegistry()
-        context = self._bound_context(
-            reg, "hermes_plugins.pkg", allowed=False
-        )
+        _host_register_plugin_policy(reg, "hermes_plugins.pkg", False)
         handler = eval("lambda *a, **k: 'sub'", {"__name__": "hermes_plugins.pkg.handlers"})
         reg.register(
             name="sub_tool", toolset="pkg-ts",
             schema={"name": "sub_tool", "description": "", "parameters": {"type": "object", "properties": {}}},
             handler=handler,
         )
-        # The loader-bound facade may clean up a handler from any submodule in
-        # the same plugin package.
         with patch.object(
-            ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
+            ToolRegistry, "_caller_module", return_value="hermes_plugins.pkg"
         ):
-            reg.deregister("sub_tool", _plugin_context=context)
-        assert reg._tools.get("sub_tool") is None
+            with pytest.raises(PermissionError, match="through the host registry"):
+                reg.deregister("sub_tool")
+        assert reg._tools.get("sub_tool") is not None
 
-    def test_opted_in_plugin_submodule_can_deregister(self):
-        """An opted-in plugin calling deregister() from a submodule must succeed.
-
-        register_plugin_override_policy records the opt-in under the package
-        root (``hermes_plugins.allowed``).  If the caller is a submodule
-        (``hermes_plugins.allowed.cleanup``), the old code looked up
-        ``_plugin_override_policy.get("hermes_plugins.allowed.cleanup")`` →
-        False and wrongly raised PermissionError.  The fix uses caller_root
-        for the policy lookup so submodule callers inherit the package opt-in
-        (egilewski review #2 on #55840).
-        """
+    def test_opted_in_plugin_submodule_cannot_deregister(self):
         reg = ToolRegistry()
         reg.register(
             name="protected", toolset="terminal",
             schema={"name": "protected", "description": "", "parameters": {"type": "object", "properties": {}}},
             handler=lambda *a, **k: "built-in",
         )
-        context = self._bound_context(
-            reg, "hermes_plugins.allowed", allowed=True
-        )
+        _host_register_plugin_policy(reg, "hermes_plugins.allowed", True)
         with patch.object(
-            ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
+            ToolRegistry,
+            "_caller_module",
+            return_value="hermes_plugins.allowed.cleanup",
         ):
-            reg.deregister("protected", _plugin_context=context)
-        assert reg._tools.get("protected") is None
+            with pytest.raises(PermissionError, match="through the host registry"):
+                reg.deregister("protected")
+        assert reg._tools.get("protected") is not None
 
     def test_self_minted_policy_cannot_authorize_deregistration(self):
         reg = self._reg()
-        context = object()
         with patch.object(
             ToolRegistry,
             "_caller_module",
@@ -735,8 +709,8 @@ class TestDeregisterAuthorization:
             "_caller_module",
             return_value="hermes_plugins.attacker.tools",
         ):
-            with pytest.raises(PermissionError, match="plugin host facade"):
-                reg.deregister("protected", _plugin_context=context)
+            with pytest.raises(PermissionError, match="through the host registry"):
+                reg.deregister("protected")
 
         assert reg._tools.get("protected") is not None
 
@@ -748,17 +722,13 @@ class TestDeregisterAuthorization:
             schema=_make_schema("mcp__protected__read"),
             handler=lambda *_args, **_kwargs: "protected",
         )
-        context = self._bound_context(
-            reg, "hermes_plugins.attacker", allowed=False
-        )
+        _host_register_plugin_policy(reg, "hermes_plugins.attacker", False)
 
         with patch.object(
-            ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
+            ToolRegistry, "_caller_module", return_value="hermes_plugins.attacker"
         ):
-            with pytest.raises(PermissionError, match="allow_tool_override"):
-                reg.deregister(
-                    "mcp__protected__read", _plugin_context=context
-                )
+            with pytest.raises(PermissionError, match="through the host registry"):
+                reg.deregister("mcp__protected__read")
 
         assert reg._tools.get("mcp__protected__read") is not None
 
@@ -786,6 +756,67 @@ class TestDeregisterAuthorization:
 
 
 class TestPluginMediaDeliveryAuthorization:
+    def test_forged_host_module_globals_cannot_create_policy(self):
+        from hermes_cli import plugins as plugins_mod
+
+        reg = ToolRegistry()
+        namespace = "hermes_plugins.forged_host"
+
+        with pytest.raises(PermissionError, match="plugin host"):
+            exec(
+                "registry.register_plugin_override_policy(namespace, True)",
+                vars(plugins_mod),
+                {"registry": reg, "namespace": namespace},
+            )
+
+        assert reg.snapshot_plugin_override_policy(namespace) is None
+
+    def test_stolen_permit_cannot_be_used_by_direct_registry_call(self):
+        reg = ToolRegistry()
+        namespace = "hermes_plugins.trusted"
+        policy = _host_register_plugin_policy(
+            reg,
+            namespace,
+            False,
+            media_delivery_allowed=True,
+        )
+        with patch.object(
+            ToolRegistry, "_caller_is_plugin_host_method", return_value=True
+        ):
+            permit = reg._bind_plugin_registration_context(namespace, policy)
+        handler = eval(
+            "lambda *a, **k: 'MEDIA:/tmp/package.pdf'",
+            {"__name__": namespace},
+        )
+
+        with pytest.raises(PermissionError, match="plugin host"):
+            reg.register(
+                name="stolen_permit_render",
+                toolset="stolen",
+                schema=_make_schema("stolen_permit_render"),
+                handler=handler,
+                auto_deliver_media=True,
+                _plugin_permit=permit,
+            )
+
+        assert reg.snapshot_registration("stolen_permit_render") is None
+
+    def test_forged_host_module_globals_cannot_restore_policy(self):
+        from hermes_cli import plugins as plugins_mod
+
+        reg = ToolRegistry()
+        namespace = "hermes_plugins.forged_restore"
+        policy = _host_register_plugin_policy(reg, namespace, True)
+
+        with pytest.raises(PermissionError, match="plugin host"):
+            exec(
+                "registry.restore_plugin_override_policy(namespace, policy, None)",
+                vars(plugins_mod),
+                {"registry": reg, "namespace": namespace, "policy": policy},
+            )
+
+        assert reg.snapshot_plugin_override_policy(namespace) is policy
+
     def test_legacy_positional_override_does_not_enable_media_delivery(self):
         reg = ToolRegistry()
         schema = _make_schema("legacy_override")
@@ -1009,7 +1040,7 @@ class TestPluginMediaDeliveryAuthorization:
         with (
             patch.object(ToolRegistry, "current_scope_key", return_value="/profiles/a"),
             patch.object(
-                ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
+                ToolRegistry, "_caller_is_plugin_host_method", return_value=True
             ),
             pytest.raises(PermissionError, match="stale or missing policy"),
         ):

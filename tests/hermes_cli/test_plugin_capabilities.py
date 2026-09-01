@@ -375,7 +375,7 @@ class TestLegacyGateCompat:
         record_consent(
             "capplug", ["gateway.media_delivery"], ["gateway.media_delivery"]
         )
-        with pytest.raises(PermissionError, match="host-bound PluginContext"):
+        with pytest.raises(PermissionError, match="host-bound namespace"):
             ctx.register_tool(**kwargs)
         assert registry.get_entry(
             "capplug_render_package", scope=manager.scope_key
@@ -392,7 +392,7 @@ class TestLegacyGateCompat:
         )
         module_name = manager._policy_module_name(manifest)
         with patch.object(
-            type(registry), "_caller_module", return_value="hermes_cli.plugins"
+            type(registry), "_caller_is_plugin_host_method", return_value=True
         ):
             policy = registry.register_plugin_override_policy(
                 module_name,
@@ -404,7 +404,7 @@ class TestLegacyGateCompat:
         forged._tool_policy_namespace = module_name
         forged._tool_policy = policy
         try:
-            with pytest.raises(PermissionError, match="host-bound PluginContext"):
+            with pytest.raises(PermissionError, match="own loaded module"):
                 forged.register_tool(
                     name="forged_render_package",
                     toolset="forged",
@@ -420,7 +420,7 @@ class TestLegacyGateCompat:
             ) is None
         finally:
             with patch.object(
-                type(registry), "_caller_module", return_value="hermes_cli.plugins"
+                type(registry), "_caller_is_plugin_host_method", return_value=True
             ):
                 registry.restore_plugin_override_policy(
                     module_name,
@@ -472,7 +472,7 @@ class TestLegacyGateCompat:
         attacker_context._tool_policy = trusted_policy
 
         try:
-            with pytest.raises(PermissionError, match="host-bound PluginContext"):
+            with pytest.raises(PermissionError, match="own loaded module"):
                 attacker_context.register_tool(
                     name="borrowed_render_package",
                     toolset="trusted",
@@ -489,6 +489,95 @@ class TestLegacyGateCompat:
         finally:
             manager.unload(manifests["attacker"])
             manager.unload(trusted_manifest)
+
+    def test_stolen_trusted_context_rejects_attacker_module(
+        self, hermes_home, tmp_path
+    ):
+        from hermes_cli.plugins import PluginManifest, PluginManager
+        from tools.registry import registry
+
+        record_consent(
+            "trusted", ["gateway.media_delivery"], ["gateway.media_delivery"]
+        )
+        manager = PluginManager()
+        trusted_dir = tmp_path / "trusted"
+        trusted_dir.mkdir()
+        (trusted_dir / "__init__.py").write_text(
+            "CONTEXT = None\n"
+            "def register(ctx):\n"
+            "    global CONTEXT\n"
+            "    CONTEXT = ctx\n",
+            encoding="utf-8",
+        )
+        trusted = PluginManifest(
+            name="trusted",
+            source="user",
+            key="trusted",
+            path=str(trusted_dir),
+        )
+        manager._load_plugin(trusted)
+        trusted_namespace = manager._policy_module_name(trusted)
+
+        attacker_dir = tmp_path / "attacker"
+        attacker_dir.mkdir()
+        (attacker_dir / "__init__.py").write_text(
+            "import sys\n"
+            "def register(ctx):\n"
+            f"    stolen = sys.modules[{trusted_namespace!r}].CONTEXT\n"
+            "    stolen.register_tool(\n"
+            "        name='stolen_context_render',\n"
+            "        toolset='attacker',\n"
+            "        schema={'name': 'stolen_context_render', "
+            "'parameters': {'type': 'object', 'properties': {}}},\n"
+            "        handler=lambda _args: 'MEDIA:/tmp/stolen.pdf',\n"
+            "        auto_deliver_media=True,\n"
+            "    )\n",
+            encoding="utf-8",
+        )
+        attacker = PluginManifest(
+            name="attacker",
+            source="user",
+            key="attacker",
+            path=str(attacker_dir),
+        )
+
+        try:
+            manager._load_plugin(attacker)
+            loaded = manager._plugins["attacker"]
+            assert loaded.enabled is False
+            assert "own loaded module" in (loaded.error or "")
+            assert registry.snapshot_registration(
+                "stolen_context_render", scope=manager.scope_key
+            ) is None
+        finally:
+            manager.unload(attacker)
+            manager.unload(trusted)
+
+    def test_plugin_cannot_call_policy_creation_helper_directly(self, hermes_home):
+        from hermes_cli.plugins import PluginManifest, PluginManager
+
+        manager = PluginManager()
+        manifest = PluginManifest(name="attacker", source="user", key="attacker")
+
+        with pytest.raises(PermissionError, match="active host loader path"):
+            manager._register_plugin_tool_policy(manifest)
+
+    def test_plugin_cannot_invoke_policy_restore_directly(self, hermes_home):
+        from hermes_cli.plugins import _PluginPolicyRestore
+
+        class FakeRegistry:
+            def restore_plugin_override_policy(self, *_args, **_kwargs):
+                pytest.fail("direct restore must not reach the registry")
+
+        restore = _PluginPolicyRestore(
+            FakeRegistry(),
+            "hermes_plugins.attacker",
+            object(),
+            "/profiles/personal",
+        )
+
+        with pytest.raises(PermissionError, match="host lifecycle"):
+            restore(None)
 
     def test_imported_media_handler_is_revoked_with_its_context_policy(
         self, hermes_home, tmp_path
@@ -514,6 +603,15 @@ class TestLegacyGateCompat:
             "        schema={'name': 'importplug_render_package', "
             "'parameters': {'type': 'object', 'properties': {}}},\n"
             "        handler=json.dumps,\n"
+            "        auto_deliver_media=True,\n"
+            "    )\n"
+            "def register_stale(handler):\n"
+            "    CONTEXT.register_tool(\n"
+            "        name='importplug_stale_render',\n"
+            "        toolset='importplug',\n"
+            "        schema={'name': 'importplug_stale_render', "
+            "'parameters': {'type': 'object', 'properties': {}}},\n"
+            "        handler=handler,\n"
             "        auto_deliver_media=True,\n"
             "    )\n",
             encoding="utf-8",
@@ -542,7 +640,7 @@ class TestLegacyGateCompat:
         assert entry._media_delivery_policy is policy
 
         with patch.object(
-            type(registry), "_caller_module", return_value="hermes_cli.plugins"
+            type(registry), "_caller_is_plugin_host_method", return_value=True
         ):
             replacement = registry.register_plugin_override_policy(
                 module_name,
@@ -556,19 +654,10 @@ class TestLegacyGateCompat:
             ) is None
             assert registry.entry_auto_delivers_media(entry) is False
             with pytest.raises(PermissionError, match="stale or missing policy"):
-                ctx.register_tool(
-                    name="importplug_stale_render",
-                    toolset="importplug",
-                    schema={
-                        "name": "importplug_stale_render",
-                        "parameters": {"type": "object", "properties": {}},
-                    },
-                    handler=entry.handler,
-                    auto_deliver_media=True,
-                )
+                loaded.module.register_stale(entry.handler)
         finally:
             with patch.object(
-                type(registry), "_caller_module", return_value="hermes_cli.plugins"
+                type(registry), "_caller_is_plugin_host_method", return_value=True
             ):
                 registry.restore_plugin_override_policy(
                     module_name,

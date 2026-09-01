@@ -112,6 +112,47 @@ logger = logging.getLogger(__name__)
 PLUGIN_MEDIA_DELIVERY_CONTRACT_VERSION = 1
 
 
+class _PluginPolicyRestore:
+    """Lifecycle-only inverse for one exact plugin policy generation.
+
+    The replacement coordinator may choose which still-live predecessor should
+    be restored, but plugins must not be able to turn the manager into a
+    confused deputy by supplying policy objects directly.
+    """
+
+    __slots__ = ("_current", "_module_name", "_registry", "_scope")
+
+    def __init__(
+        self,
+        registry: Any,
+        module_name: str,
+        current: Any,
+        scope: str,
+    ) -> None:
+        self._registry = registry
+        self._module_name = module_name
+        self._current = current
+        self._scope = scope
+
+    def __call__(self, replacement: Any) -> bool:
+        caller = sys._getframe(1)
+        coordinator_module = sys.modules.get(type(replacement_coordinator).__module__)
+        if (
+            coordinator_module is None
+            or caller.f_globals is not vars(coordinator_module)
+            or caller.f_code is not type(replacement_coordinator).dispose.__code__
+        ):
+            raise PermissionError(
+                "Plugin tool policy restoration requires the host lifecycle."
+            )
+        return self._registry.restore_plugin_override_policy(
+            self._module_name,
+            self._current,
+            replacement,
+            scope=self._scope,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Plugin developer debug logging
 # ---------------------------------------------------------------------------
@@ -1472,6 +1513,7 @@ class PluginContext:
         self._manager = manager
         self._tool_policy_namespace: Optional[str] = None
         self._tool_policy: Any = None
+        self._tool_registration_permit: Any = None
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
@@ -1785,6 +1827,39 @@ class PluginContext:
 
     # -- tool registration --------------------------------------------------
 
+    def _assert_privileged_tool_caller(self) -> None:
+        """Bind privileged registration to this plugin's real loaded module."""
+        namespace = self._tool_policy_namespace
+        if not namespace:
+            raise PermissionError(
+                "Plugin tool registration has no host-bound namespace"
+            )
+        try:
+            frame = sys._getframe(1)
+            host_globals = globals()
+            while frame is not None and frame.f_globals is host_globals:
+                frame = frame.f_back
+            module_name = (
+                frame.f_globals.get("__name__", "") if frame is not None else ""
+            )
+            module = sys.modules.get(module_name)
+            valid_module = bool(
+                frame is not None
+                and module is not None
+                and frame.f_globals is vars(module)
+                and (
+                    module_name == namespace
+                    or module_name.startswith(f"{namespace}.")
+                )
+            )
+        except Exception:
+            valid_module = False
+        if not valid_module:
+            raise PermissionError(
+                f"Plugin {self.plugin_id!r} may perform privileged tool "
+                "registration only from its own loaded module."
+            )
+
     @_serialized_replacement
     def register_tool(
         self,
@@ -1830,6 +1905,8 @@ class PluginContext:
                 f"Plugin {self.manifest.name!r} cannot mark tool {name!r} as a "
                 "trusted media producer without gateway.media_delivery consent."
             )
+        if override or auto_deliver_media:
+            self._assert_privileged_tool_caller()
 
         from tools.registry import registry
 
@@ -1874,7 +1951,7 @@ class PluginContext:
             scope=scope,
             _plugin_namespace=self._tool_policy_namespace,
             _plugin_policy=self._tool_policy,
-            _plugin_context=self,
+            _plugin_permit=self._tool_registration_permit,
         )
         registered = registry.snapshot_registration(name, scope=scope)
         if (
@@ -5120,11 +5197,12 @@ class PluginManager:
             tool_context._tool_policy = policy
             from tools.registry import registry as _registry
 
-            _registry._bind_plugin_registration_context(
-                tool_context,
-                module_name,
-                policy,
-                scope=self.scope_key,
+            tool_context._tool_registration_permit = (
+                _registry._bind_plugin_registration_context(
+                    module_name,
+                    policy,
+                    scope=self.scope_key,
+                )
             )
             self._predeclared_tool_policies[lookup_key] = policy
             module = self._load_directory_module(manifest, module_name=module_name)
@@ -5314,11 +5392,12 @@ class PluginManager:
             active_tool_policy = predeclared_policy
         ctx._tool_policy_namespace = _module_name
         ctx._tool_policy = active_tool_policy
-        _registry._bind_plugin_registration_context(
-            ctx,
-            _module_name,
-            active_tool_policy,
-            scope=self.scope_key,
+        ctx._tool_registration_permit = (
+            _registry._bind_plugin_registration_context(
+                _module_name,
+                active_tool_policy,
+                scope=self.scope_key,
+            )
         )
         try:
             # A deferred platform whose client tools were already registered at
@@ -5512,6 +5591,15 @@ class PluginManager:
         ``ctx.register_tool`` call.  Eager loading uses this same helper; a
         deferred load retains and reuses the returned generation.
         """
+        caller = sys._getframe(1)
+        allowed_callers = {
+            type(self)._register_deferred_platform_tools.__code__,
+            type(self)._load_plugin_scoped.__code__,
+        }
+        if caller.f_globals is not globals() or caller.f_code not in allowed_callers:
+            raise PermissionError(
+                "Plugin tool policy creation requires an active host loader path."
+            )
         from tools.registry import registry
 
         module_name = self._policy_module_name(manifest)
@@ -5532,11 +5620,11 @@ class PluginManager:
                 ("tool_override_policy", self.scope_key, module_name),
                 current=current_policy,
                 previous=previous_policy,
-                restore=lambda replacement: registry.restore_plugin_override_policy(
+                restore=_PluginPolicyRestore(
+                    registry,
                     module_name,
                     current_policy,
-                    replacement,
-                    scope=self.scope_key,
+                    self.scope_key,
                 ),
             )
             self._track_registration(
