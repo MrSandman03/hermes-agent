@@ -112,6 +112,8 @@ def test_direct_restore_cannot_borrow_trusted_media_policy():
 
     assert registry.snapshot_registration("ordinary_tool") is ordinary
     assert registry.entry_auto_delivers_media(forged) is False
+    assert registry.entry_is_host_registered(forged) is False
+    assert not hasattr(ordinary, "_registration_owner")
 
     object.__setattr__(ordinary, "auto_deliver_media", True)
     object.__setattr__(ordinary, "_media_delivery_policy", policy)

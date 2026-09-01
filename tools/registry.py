@@ -247,10 +247,6 @@ def _save_discovery_cache(cache: Dict[str, list]) -> None:
         logger.debug("Could not write tool discovery cache %s: %s", path, e)
 
 
-_UNSET_REGISTRATION_OWNER = object()
-_HOST_REGISTRATION_OWNER = object()
-
-
 class ToolEntry:
     """Metadata for a single registered tool."""
 
@@ -258,15 +254,14 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
-        "auto_deliver_media", "_media_delivery_policy", "_registration_owner",
+        "auto_deliver_media", "_media_delivery_policy",
         "_sealed",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
                  max_result_size_chars=None, dynamic_schema_overrides=None,
-                 auto_deliver_media=False, media_delivery_policy=None,
-                 registration_owner=_UNSET_REGISTRATION_OWNER):
+                 auto_deliver_media=False, media_delivery_policy=None):
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "toolset", toolset)
         object.__setattr__(self, "schema", schema)
@@ -293,10 +288,6 @@ class ToolEntry:
         # identity that authorized their registration so revocation can fail
         # closed even if a plugin bypasses PluginContext's ownership ledger.
         object.__setattr__(self, "_media_delivery_policy", media_delivery_policy)
-        # Record the registration owner independently of the callable's
-        # defining module. A plugin can intentionally register a host-defined
-        # callable, so callable provenance alone is not an authority check.
-        object.__setattr__(self, "_registration_owner", registration_owner)
         object.__setattr__(self, "_sealed", True)
 
     def __setattr__(self, name, value):
@@ -568,6 +559,22 @@ class ToolRegistry:
         # remains confined to the profile where its module was loaded.
         self._plugin_module_scopes: Dict[str, Set[Optional[str]]] = {}
         self._toolset_checks: Dict[str, Callable] = {}
+        host_entries: Set[ToolEntry] = set()
+        register_code = type(self).register.__code__
+
+        def mark_host_entry(entry: ToolEntry) -> None:
+            try:
+                caller = sys._getframe(1)
+            except Exception:
+                return
+            if caller.f_code is register_code:
+                host_entries.add(entry)
+
+        def is_host_entry(entry: ToolEntry) -> bool:
+            return entry in host_entries
+
+        self._host_entry_marker = mark_host_entry
+        self._host_entry_verifier = is_host_entry
         self._toolset_aliases: Dict[str, str] = {}
         # MCP dynamic refresh can mutate the registry while other threads are
         # reading tool metadata, so keep mutations serialized and readers on
@@ -882,16 +889,14 @@ class ToolRegistry:
             return False
 
     def entry_is_host_registered(self, entry: Optional[ToolEntry]) -> bool:
-        """Return whether an entry's handler is defined outside plugin modules.
+        """Return whether this registry created *entry* as a host entry.
 
-        Built-in and MCP handlers are defined in host modules; a plugin that
-        overrides a built-in name registers a handler defined in its own
-        module, so the original host implementation stays distinguishable
-        from any replacement by where the handler was DEFINED.
+        The provenance set is private to this registry instance. It is not
+        stored on the entry, where a plugin could copy a public marker.
         """
         if entry is None:
             return False
-        return entry._registration_owner is _HOST_REGISTRATION_OWNER
+        return self._host_entry_verifier(entry)
 
     def _plugin_owner_of(self, handler: Callable) -> Optional[str]:
         """Return the plugin module namespace that defined *handler*, or None
@@ -1199,11 +1204,8 @@ class ToolRegistry:
                 auto_deliver_media=auto_deliver_media,
                 media_delivery_policy=media_policy,
             )
-            object.__setattr__(
-                registered,
-                "_registration_owner",
-                _HOST_REGISTRATION_OWNER if owner is None else owner,
-            )
+            if owner is None:
+                self._host_entry_marker(registered)
             target[name] = registered
             if media_policy is not None:
                 self._plugin_media_registrations.setdefault(media_policy, []).append(
