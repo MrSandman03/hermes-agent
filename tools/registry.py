@@ -561,6 +561,14 @@ class ToolRegistry:
         self._toolset_checks: Dict[str, Callable] = {}
         host_entries: Set[ToolEntry] = set()
         register_code = type(self).register.__code__
+        caller_allowed = _plugin_host_caller_allowed
+
+        def host_caller_allowed(*method_names: str) -> bool:
+            try:
+                caller = sys._getframe(2)
+                return caller_allowed(caller, method_names[0], method_names[1:])
+            except Exception:
+                return False
 
         def mark_host_entry(entry: ToolEntry) -> None:
             try:
@@ -575,6 +583,7 @@ class ToolRegistry:
 
         self._host_entry_marker = mark_host_entry
         self._host_entry_verifier = is_host_entry
+        self._host_caller_verifier = host_caller_allowed
         self._toolset_aliases: Dict[str, str] = {}
         # MCP dynamic refresh can mutate the registry while other threads are
         # reading tool metadata, so keep mutations serialized and readers on
@@ -586,6 +595,15 @@ class ToolRegistry:
         # against it: a cache entry keyed on the generation is valid for as
         # long as the generation hasn't changed.
         self._generation: int = 0
+
+    def __setattr__(self, name, value):
+        if name in {
+            "_host_entry_marker",
+            "_host_entry_verifier",
+            "_host_caller_verifier",
+        } and name in self.__dict__:
+            raise AttributeError(f"Registry security hook {name!r} is immutable")
+        object.__setattr__(self, name, value)
 
     @staticmethod
     def current_scope_key() -> str:
@@ -715,7 +733,7 @@ class ToolRegistry:
         The identity-bearing result lets plugin unload/reload revoke a stale
         authorization without losing durable module-to-profile attribution.
         """
-        if not self._caller_is_plugin_host_method(
+        if not self._host_caller_verifier(
             "PluginManager", "_register_plugin_tool_policy"
         ):
             raise PermissionError(
@@ -752,7 +770,7 @@ class ToolRegistry:
         scope: Optional[str] = None,
     ) -> bool:
         """CAS-restore policy state while retaining durable scope attribution."""
-        if not self._caller_is_plugin_host_method("_PluginPolicyRestore", "__call__"):
+        if not self._host_caller_verifier("_PluginPolicyRestore", "__call__"):
             raise PermissionError(
                 "Plugin tool policies may only be restored by the plugin host."
             )
@@ -803,7 +821,7 @@ class ToolRegistry:
         scope: Optional[str] = None,
     ) -> _PluginRegistrationPermit:
         """Issue one opaque permit for an exact policy generation."""
-        if not self._caller_is_plugin_host_method(
+        if not self._host_caller_verifier(
             "PluginManager",
             "_register_deferred_platform_tools",
             "_load_plugin_scoped",
@@ -1057,7 +1075,7 @@ class ToolRegistry:
             _plugin_namespace is not None
             or _plugin_policy is not None
             or _plugin_permit is not None
-        ) and not self._caller_is_plugin_host_method("PluginContext", "register_tool"):
+        ) and not self._host_caller_verifier("PluginContext", "register_tool"):
             raise PermissionError(
                 "Explicit plugin policy bindings may only be supplied by the "
                 "plugin host."
@@ -1296,7 +1314,7 @@ class ToolRegistry:
         newer entry under the same name, in which case unloading this entry
         must leave the newer entry untouched.
         """
-        if not self._caller_is_plugin_host_method(
+        if not self._host_caller_verifier(
             "_ToolRegistrationRestore", "__call__"
         ):
             raise PermissionError(

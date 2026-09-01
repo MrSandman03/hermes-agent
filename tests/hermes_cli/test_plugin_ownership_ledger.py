@@ -13,46 +13,30 @@ import yaml
 
 
 def _host_register_plugin_policy(registry, *args, **kwargs):
-    from unittest.mock import patch
+    from tests.tools.test_registry import _host_registry_call
 
-    from tools.registry import ToolRegistry
-
-    with patch.object(
-        ToolRegistry, "_caller_is_plugin_host_method", return_value=True
-    ):
+    with _host_registry_call(registry):
         return registry.register_plugin_override_policy(*args, **kwargs)
 
 
 def _host_restore_plugin_policy(registry, *args, **kwargs):
-    from unittest.mock import patch
+    from tests.tools.test_registry import _host_registry_call
 
-    from tools.registry import ToolRegistry
-
-    with patch.object(
-        ToolRegistry, "_caller_is_plugin_host_method", return_value=True
-    ):
+    with _host_registry_call(registry):
         return registry.restore_plugin_override_policy(*args, **kwargs)
 
 
 def _host_restore_tool_registration(registry, *args, **kwargs):
-    from unittest.mock import patch
+    from tests.tools.test_registry import _host_registry_call
 
-    from tools.registry import ToolRegistry
-
-    with patch.object(
-        ToolRegistry, "_caller_is_plugin_host_method", return_value=True
-    ):
+    with _host_registry_call(registry):
         return registry.restore_registration(*args, **kwargs)
 
 
 def _host_bind_plugin_context(registry, namespace, policy, *, scope):
-    from unittest.mock import patch
+    from tests.tools.test_registry import _host_registry_call
 
-    from tools.registry import ToolRegistry
-
-    with patch.object(
-        ToolRegistry, "_caller_is_plugin_host_method", return_value=True
-    ):
+    with _host_registry_call(registry):
         return registry._bind_plugin_registration_context(
             namespace, policy, scope=scope
         )

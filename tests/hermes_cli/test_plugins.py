@@ -33,6 +33,7 @@ from hermes_cli.middleware import (
     apply_tool_request_middleware,
     run_tool_execution_middleware,
 )
+from tests.tools.test_registry import _host_registry_call
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -1609,9 +1610,7 @@ class TestPluginContext:
             manifest=manifest,
         )
         module_name = manager._policy_module_name(manifest)
-        with patch.object(
-            ToolRegistry, "_caller_is_plugin_host_method", return_value=True
-        ):
+        with _host_registry_call(registry):
             policy = registry.register_plugin_override_policy(
                 module_name,
                 True,
@@ -1619,9 +1618,7 @@ class TestPluginContext:
             )
         context._tool_policy_namespace = module_name
         context._tool_policy = policy
-        with patch.object(
-            ToolRegistry, "_caller_is_plugin_host_method", return_value=True
-        ):
+        with _host_registry_call(registry):
             context._tool_registration_permit = (
                 registry._bind_plugin_registration_context(
                 module_name,
@@ -1654,9 +1651,7 @@ class TestPluginContext:
             assert entry.auto_deliver_media is False
         finally:
             current = registry.snapshot_registration(name)
-            with patch.object(
-                ToolRegistry, "_caller_is_plugin_host_method", return_value=True
-            ):
+            with _host_registry_call(registry):
                 if current is not None:
                     registry.restore_registration(name, current, base_entry)
                 if base_entry is not None:

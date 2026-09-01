@@ -25,6 +25,7 @@ from hermes_cli.plugin_capabilities import (
     plugin_capability_granted,
     record_consent,
 )
+from tests.tools.test_registry import _host_registry_call
 
 
 @pytest.fixture()
@@ -407,9 +408,7 @@ class TestLegacyGateCompat:
             "forged", ["gateway.media_delivery"], ["gateway.media_delivery"]
         )
         module_name = manager._policy_module_name(manifest)
-        with patch.object(
-            type(registry), "_caller_is_plugin_host_method", return_value=True
-        ):
+        with _host_registry_call(registry):
             policy = registry.register_plugin_override_policy(
                 module_name,
                 False,
@@ -435,9 +434,7 @@ class TestLegacyGateCompat:
                 "forged_render_package", scope=manager.scope_key
             ) is None
         finally:
-            with patch.object(
-                type(registry), "_caller_is_plugin_host_method", return_value=True
-            ):
+            with _host_registry_call(registry):
                 registry.restore_plugin_override_policy(
                     module_name,
                     policy,
@@ -720,11 +717,7 @@ class TestLegacyGateCompat:
                 legitimate_lease.slot[2], scope=manager.scope_key
             )
             if current is legitimate_lease.current:
-                with patch.object(
-                    ToolRegistry,
-                    "_caller_is_plugin_host_method",
-                    return_value=True,
-                ):
+                with _host_registry_call(registry):
                     registry.restore_plugin_override_policy(
                         legitimate_lease.slot[2],
                         current,
@@ -792,9 +785,7 @@ class TestLegacyGateCompat:
         assert entry is not None
         assert entry._media_delivery_policy is policy
 
-        with patch.object(
-            type(registry), "_caller_is_plugin_host_method", return_value=True
-        ):
+        with _host_registry_call(registry):
             replacement = registry.register_plugin_override_policy(
                 module_name,
                 False,
@@ -809,9 +800,7 @@ class TestLegacyGateCompat:
             with pytest.raises(PermissionError, match="active host loader lifecycle"):
                 loaded.module.register_stale(entry.handler)
         finally:
-            with patch.object(
-                type(registry), "_caller_is_plugin_host_method", return_value=True
-            ):
+            with _host_registry_call(registry):
                 registry.restore_plugin_override_policy(
                     module_name,
                     replacement,

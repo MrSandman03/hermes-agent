@@ -3,6 +3,7 @@
 import json
 import logging
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -31,17 +32,23 @@ def _make_schema(name="test_tool"):
 
 
 def _host_register_plugin_policy(registry, *args, **kwargs):
-    with patch.object(
-        ToolRegistry, "_caller_is_plugin_host_method", return_value=True
-    ):
+    with _host_registry_call(registry):
         return registry.register_plugin_override_policy(*args, **kwargs)
 
 
 def _host_restore_plugin_policy(registry, *args, **kwargs):
-    with patch.object(
-        ToolRegistry, "_caller_is_plugin_host_method", return_value=True
-    ):
+    with _host_registry_call(registry):
         return registry.restore_plugin_override_policy(*args, **kwargs)
+
+
+@contextmanager
+def _host_registry_call(registry):
+    original = registry.__dict__["_host_caller_verifier"]
+    object.__setattr__(registry, "_host_caller_verifier", lambda *_names: True)
+    try:
+        yield
+    finally:
+        object.__setattr__(registry, "_host_caller_verifier", original)
 
 
 class TestRegisterAndDispatch:
@@ -645,9 +652,7 @@ class TestDeregisterAuthorization:
     @staticmethod
     def _bound_context(reg, namespace, *, allowed):
         policy = _host_register_plugin_policy(reg, namespace, allowed)
-        with patch.object(
-            ToolRegistry, "_caller_is_plugin_host_method", return_value=True
-        ):
+        with _host_registry_call(reg):
             return reg._bind_plugin_registration_context(namespace, policy)
 
     def test_plugin_cannot_deregister_unowned_tool_without_opt_in(self):

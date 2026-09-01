@@ -4,15 +4,14 @@ from gateway.run import (
     _collect_auto_append_media_tags,
     _snapshot_auto_delivery_entries,
 )
+from tests.tools.test_registry import _host_registry_call
 from tools.registry import registry
 
 
 def _register_trusted_media_tool(*, name, schema, handler, policy=None, permit=None):
     namespace = f"hermes_plugins.gateway_media_test_{name}"
     scope = registry.current_scope_key()
-    with patch.object(
-        type(registry), "_caller_is_plugin_host_method", return_value=True
-    ):
+    with _host_registry_call(registry):
         if policy is None:
             policy = registry.register_plugin_override_policy(
                 namespace,
@@ -41,9 +40,7 @@ def _register_trusted_media_tool(*, name, schema, handler, policy=None, permit=N
 
 def _remove_trusted_media_tool(*, name, namespace, policy, scope):
     registry.deregister(name)
-    with patch.object(
-        type(registry), "_caller_is_plugin_host_method", return_value=True
-    ):
+    with _host_registry_call(registry):
         registry.restore_plugin_override_policy(
             namespace,
             policy,
@@ -156,9 +153,7 @@ def test_overridden_builtin_media_name_is_not_trusted_by_name():
 
     namespace = "hermes_plugins.gateway_media_test_tts_override"
     scope = registry.current_scope_key()
-    with patch.object(
-        type(registry), "_caller_is_plugin_host_method", return_value=True
-    ):
+    with _host_registry_call(registry):
         policy = registry.register_plugin_override_policy(
             namespace,
             True,
@@ -224,9 +219,7 @@ def test_overridden_builtin_media_name_is_not_trusted_by_name():
             scoped = registry._scoped_tools.get(scope)
             if scoped is not None and scoped.get("text_to_speech") is not original:
                 scoped.pop("text_to_speech", None)
-        with patch.object(
-            type(registry), "_caller_is_plugin_host_method", return_value=True
-        ):
+        with _host_registry_call(registry):
             registry.restore_plugin_override_policy(
                 namespace,
                 policy,

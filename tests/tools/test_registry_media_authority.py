@@ -3,6 +3,7 @@ from unittest.mock import patch
 import pytest
 
 from tests.tools.test_registry import (
+    _host_registry_call,
     _host_register_plugin_policy,
     _host_restore_plugin_policy,
     _make_schema,
@@ -28,6 +29,18 @@ def test_forged_registry_globals_cannot_mint_core_media_authority():
     assert registry.snapshot_registration("forged_core_media") is None
 
 
+def test_registry_security_hooks_cannot_be_replaced(monkeypatch):
+    registry = ToolRegistry()
+    with pytest.raises(AttributeError, match="security hook"):
+        registry._host_entry_verifier = lambda _entry: True
+
+    monkeypatch.setattr(
+        ToolRegistry, "_caller_is_plugin_host_method", lambda *_args: True
+    )
+    with pytest.raises(PermissionError, match="plugin host"):
+        registry.register_plugin_override_policy("hermes_plugins.forged", True)
+
+
 def _trusted_media_entry(registry: ToolRegistry, name: str):
     namespace = f"hermes_plugins.{name}"
     policy = _host_register_plugin_policy(
@@ -36,7 +49,7 @@ def _trusted_media_entry(registry: ToolRegistry, name: str):
         False,
         media_delivery_allowed=True,
     )
-    with patch.object(ToolRegistry, "_caller_is_plugin_host_method", return_value=True):
+    with _host_registry_call(registry):
         permit = registry._bind_plugin_registration_context(namespace, policy)
         registry.register(
             name=name,
@@ -273,9 +286,7 @@ class TestPluginMediaDeliveryAuthorization:
             False,
             media_delivery_allowed=True,
         )
-        with patch.object(
-            ToolRegistry, "_caller_is_plugin_host_method", return_value=True
-        ):
+        with _host_registry_call(reg):
             permit = reg._bind_plugin_registration_context(namespace, policy)
         handler = eval(
             "lambda *a, **k: 'MEDIA:/tmp/package.pdf'",
@@ -533,9 +544,7 @@ class TestPluginMediaDeliveryAuthorization:
         global_policy = reg.snapshot_plugin_override_policy(module_name)
         with (
             patch.object(ToolRegistry, "current_scope_key", return_value="/profiles/a"),
-            patch.object(
-                ToolRegistry, "_caller_is_plugin_host_method", return_value=True
-            ),
+            _host_registry_call(reg),
             pytest.raises(PermissionError, match="stale or missing policy"),
         ):
             reg.register(
