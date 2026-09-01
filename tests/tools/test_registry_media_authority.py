@@ -78,6 +78,19 @@ def test_forged_caller_module_name_cannot_mint_host_provenance():
     assert exec_forged is not None
     assert registry.entry_is_host_registered(exec_forged) is False
 
+    compiled = compile(
+        "registry.register("
+        "name='compiled_in_host_globals', toolset='tts', "
+        "schema={'name': 'compiled_in_host_globals'}, "
+        "handler=lambda *_: 'MEDIA:/tmp/forged.pdf')",
+        registry_mod.__file__,
+        "exec",
+    )
+    exec(compiled, vars(registry_mod), {"registry": registry})
+    compiled_forged = registry.snapshot_registration("compiled_in_host_globals")
+    assert compiled_forged is not None
+    assert registry.entry_is_host_registered(compiled_forged) is False
+
 
 def _trusted_media_entry(registry: ToolRegistry, name: str):
     namespace = f"hermes_plugins.{name}"

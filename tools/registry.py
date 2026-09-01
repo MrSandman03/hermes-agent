@@ -584,6 +584,9 @@ class ToolRegistry:
             module_file = getattr(module, "__file__", None)
             if not module_file:
                 return False
+            spec = getattr(module, "__spec__", None)
+            if not getattr(spec, "_initializing", False):
+                return False
             try:
                 return Path(frame.f_code.co_filename).resolve() == Path(
                     module_file
