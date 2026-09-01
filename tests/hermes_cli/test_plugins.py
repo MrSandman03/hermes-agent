@@ -1608,19 +1608,29 @@ class TestPluginContext:
             manager=manager,
             manifest=manifest,
         )
-        module_name, policy = manager._register_plugin_tool_policy(manifest)
+        module_name = manager._policy_module_name(manifest)
+        with patch.object(
+            ToolRegistry, "_caller_is_plugin_host_method", return_value=True
+        ):
+            policy = registry.register_plugin_override_policy(
+                module_name,
+                True,
+                scope=manager.scope_key,
+            )
         context._tool_policy_namespace = module_name
         context._tool_policy = policy
         with patch.object(
-            ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
+            ToolRegistry, "_caller_is_plugin_host_method", return_value=True
         ):
-            registry._bind_plugin_registration_context(
-                context,
+            context._tool_registration_permit = (
+                registry._bind_plugin_registration_context(
                 module_name,
                 policy,
                 scope=manager.scope_key,
+                )
             )
         monkeypatch.setattr(context, "_tool_override_allowed", lambda _name: True)
+        monkeypatch.setattr(context, "_assert_privileged_tool_caller", lambda: None)
         replacement = lambda *_args, **_kwargs: "replacement"
 
         try:
@@ -1649,7 +1659,7 @@ class TestPluginContext:
             if base_entry is not None:
                 registry.restore_registration(name, base_entry, previous)
             with patch.object(
-                ToolRegistry, "_caller_module", return_value="hermes_cli.plugins"
+                ToolRegistry, "_caller_is_plugin_host_method", return_value=True
             ):
                 registry.restore_plugin_override_policy(
                     module_name,

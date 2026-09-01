@@ -22,7 +22,6 @@ import logging
 import sys
 import threading
 import time
-import weakref
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
@@ -252,6 +251,12 @@ class _PluginOverridePolicy:
     def __init__(self, allowed: bool, *, media_delivery_allowed: bool = False) -> None:
         self.allowed = bool(allowed)
         self.media_delivery_allowed = bool(media_delivery_allowed)
+
+
+class _PluginRegistrationPermit:
+    """Opaque host-issued permit for one plugin policy generation."""
+
+    __slots__ = ()
 
 
 # ---------------------------------------------------------------------------
@@ -484,11 +489,13 @@ class ToolRegistry:
             _PluginOverridePolicy,
             List[tuple[Optional[str], str, ToolEntry, Optional[ToolEntry]]],
         ] = {}
-        # Privileged PluginContext registrations are accepted only from the
-        # exact context object bound by PluginManager before plugin code runs.
-        # A policy object is intentionally insufficient: plugins can inspect
-        # registry state, construct facade objects, and call public methods.
-        self._plugin_registration_contexts = weakref.WeakKeyDictionary()
+        # Retain opaque permits, never live PluginContext objects. A plugin
+        # inspecting registry internals cannot recover another plugin's facade
+        # and invoke it as a confused deputy.
+        self._plugin_registration_permits: Dict[
+            _PluginRegistrationPermit,
+            tuple[Optional[str], str, _PluginOverridePolicy],
+        ] = {}
         # Scope attribution stays durable after policy removal so delayed code
         # remains confined to the profile where its module was loaded.
         self._plugin_module_scopes: Dict[str, Set[Optional[str]]] = {}
@@ -633,7 +640,9 @@ class ToolRegistry:
         The identity-bearing result lets plugin unload/reload revoke a stale
         authorization without losing durable module-to-profile attribution.
         """
-        if self._caller_module() != "hermes_cli.plugins":
+        if not self._caller_is_plugin_host_method(
+            "PluginManager", "_register_plugin_tool_policy"
+        ):
             raise PermissionError(
                 "Plugin tool policies may only be created by the plugin host."
             )
@@ -668,7 +677,7 @@ class ToolRegistry:
         scope: Optional[str] = None,
     ) -> bool:
         """CAS-restore policy state while retaining durable scope attribution."""
-        if self._caller_module() != "hermes_cli.plugins":
+        if not self._caller_is_plugin_host_method("_PluginPolicyRestore", "__call__"):
             raise PermissionError(
                 "Plugin tool policies may only be restored by the plugin host."
             )
@@ -689,6 +698,9 @@ class ToolRegistry:
     ) -> None:
         """CAS-restore media tools authorized by one policy generation."""
         registrations = self._plugin_media_registrations.pop(policy, [])
+        for permit, binding in list(self._plugin_registration_permits.items()):
+            if binding[2] is policy:
+                self._plugin_registration_permits.pop(permit, None)
         changed = False
         for scope, name, current, previous in reversed(registrations):
             target = (
@@ -710,14 +722,17 @@ class ToolRegistry:
 
     def _bind_plugin_registration_context(
         self,
-        context: object,
         module_namespace: str,
         policy: _PluginOverridePolicy,
         *,
         scope: Optional[str] = None,
-    ) -> None:
-        """Bind one host-created context to an exact policy generation."""
-        if self._caller_module() != "hermes_cli.plugins":
+    ) -> _PluginRegistrationPermit:
+        """Issue one opaque permit for an exact policy generation."""
+        if not self._caller_is_plugin_host_method(
+            "PluginManager",
+            "_register_deferred_platform_tools",
+            "_load_plugin_scoped",
+        ):
             raise PermissionError(
                 "Plugin registration contexts may only be bound by the plugin host."
             )
@@ -732,11 +747,13 @@ class ToolRegistry:
                     f"Plugin module {module_namespace!r} cannot bind a stale or "
                     "missing policy generation."
                 )
-            self._plugin_registration_contexts[context] = (
+            permit = _PluginRegistrationPermit()
+            self._plugin_registration_permits[permit] = (
                 scope,
                 module_namespace,
                 policy,
             )
+            return permit
 
     def _plugin_policy(
         self,
@@ -891,6 +908,28 @@ class ToolRegistry:
         except Exception:
             return ""
 
+    @staticmethod
+    def _caller_is_plugin_host_method(
+        owner_name: str,
+        *method_names: str,
+    ) -> bool:
+        """Require an exact plugin-host code frame, not a forged module name."""
+        try:
+            frame = sys._getframe(2)
+            module = sys.modules.get("hermes_cli.plugins")
+            owner = getattr(module, owner_name)
+            if frame.f_globals is not vars(module):
+                return False
+            for method_name in method_names:
+                method = getattr(owner, method_name)
+                while hasattr(method, "__wrapped__"):
+                    method = method.__wrapped__
+                if frame.f_code is method.__code__:
+                    return True
+        except Exception:
+            return False
+        return False
+
     def register(
         self,
         name: str,
@@ -910,7 +949,7 @@ class ToolRegistry:
         auto_deliver_media: bool = False,
         _plugin_namespace: Optional[str] = None,
         _plugin_policy: Optional[_PluginOverridePolicy] = None,
-        _plugin_context: object = None,
+        _plugin_permit: object = None,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -925,7 +964,11 @@ class ToolRegistry:
             raise PermissionError(
                 "An explicit plugin policy requires its plugin namespace."
             )
-        if _plugin_namespace is not None and caller_module != "hermes_cli.plugins":
+        if (
+            _plugin_namespace is not None
+            or _plugin_policy is not None
+            or _plugin_permit is not None
+        ) and not self._caller_is_plugin_host_method("PluginContext", "register_tool"):
             raise PermissionError(
                 "Explicit plugin policy bindings may only be supplied by the "
                 "plugin host."
@@ -962,8 +1005,8 @@ class ToolRegistry:
             if owner is not None and (override or auto_deliver_media):
                 expected_binding = (scope, owner, current_plugin_policy)
                 if (
-                    _plugin_context is None
-                    or self._plugin_registration_contexts.get(_plugin_context)
+                    _plugin_permit is None
+                    or self._plugin_registration_permits.get(_plugin_permit)
                     != expected_binding
                 ):
                     raise PermissionError(
@@ -1083,23 +1126,16 @@ class ToolRegistry:
                 self._toolset_checks[toolset] = check_fn
             self._generation += 1
 
-    def deregister(self, name: str, *, _plugin_context: object = None) -> None:
+    def deregister(self, name: str) -> None:
         """Remove a tool from the registry.
 
         Also cleans up the toolset check if no other tools remain in the
         same toolset.  Used by MCP dynamic tool discovery to nuke-and-repave
         when a server sends ``notifications/tools/list_changed``.
 
-        Plugin callers must present the exact ``PluginContext`` object bound by
-        the host for their active policy generation.  The same operator opt-in
-        policy as ``register(override=True)`` then governs removal of unowned
-        tools. Without these checks, a plugin could bypass that gate entirely by
-        deregistering a tool it doesn't own and then calling plain
-        ``register()`` over the now-empty slot — ``register()`` only runs its
-        override check when an ``existing`` entry is present, so removing it
-        first skips the check altogether. Core MCP discovery remains unaffected:
-        it is a host caller, while plugins cannot use the MCP lifecycle as an
-        authorization bypass.
+        Plugin callers are never allowed to deregister registry entries. Plugin
+        lifecycle cleanup uses identity-conditional ``restore_registration``
+        leases instead. Core MCP refresh remains unaffected.
         """
         with self._lock:
             caller_mod = self._caller_module()
@@ -1109,33 +1145,10 @@ class ToolRegistry:
                 if caller_owner is not None
                 else None
             )
-            if _plugin_context is not None:
-                if caller_mod != "hermes_cli.plugins":
-                    raise PermissionError(
-                        "A plugin deregistration context may only be supplied "
-                        "through the plugin host facade."
-                    )
-                binding = self._plugin_registration_contexts.get(_plugin_context)
-                if binding is None:
-                    raise PermissionError(
-                        "A tool cannot be deregistered through an unbound "
-                        "PluginContext."
-                    )
-                caller_scope, caller_owner, bound_policy = binding
-                current_plugin_policy = self._plugin_policy(
-                    caller_scope,
-                    caller_owner,
-                    allow_global_fallback=False,
-                )
-                if current_plugin_policy is not bound_policy:
-                    raise PermissionError(
-                        f"Plugin module {caller_owner!r} cannot deregister a tool "
-                        "through a stale host-bound PluginContext."
-                    )
-            elif caller_owner is not None:
+            if caller_owner is not None:
                 raise PermissionError(
                     f"Plugin module {caller_owner!r} cannot deregister a tool "
-                    "outside its host-bound PluginContext facade."
+                    "through the host registry."
                 )
             target = (
                 self._scoped_tools.get(caller_scope, {})
@@ -1153,36 +1166,6 @@ class ToolRegistry:
                 return
             if entry is None:
                 return
-            if caller_owner is not None:
-                owner = self._plugin_owner_of(entry.handler)
-                # Ownership check: bind to the plugin package root
-                # (``hermes_plugins.{name}``), not the exact module string.
-                # A handler defined in ``hermes_plugins.pkg.handlers`` is
-                # still owned by the ``hermes_plugins.pkg`` package — exact
-                # string equality would wrongly block root-module cleanup code
-                # from removing tools registered by a submodule of the same
-                # plugin (egilewski review on #55840).
-                same_plugin = bool(owner and caller_owner == owner)
-                if (
-                    caller_owner is not None
-                    and not same_plugin
-                    and not self._plugin_override_allowed(
-                        caller_scope, caller_owner
-                    )
-                ):
-                    logger.error(
-                        "Tool deregistration REJECTED: plugin %r attempted to "
-                        "remove tool %r (toolset %r) it does not own, without "
-                        "operator opt-in. Set "
-                        "plugins.entries.%s.allow_tool_override: true in "
-                        "config.yaml to allow it.",
-                        caller_mod, name, entry.toolset, caller_mod,
-                    )
-                    raise PermissionError(
-                        f"Plugin module {caller_mod!r} cannot deregister tool "
-                        f"{name!r} (toolset {entry.toolset!r}) without operator "
-                        f"opt-in (allow_tool_override)."
-                    )
             del target[name]
             if caller_scope is not None and not target:
                 self._scoped_tools.pop(caller_scope, None)
