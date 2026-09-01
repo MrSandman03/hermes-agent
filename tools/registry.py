@@ -29,6 +29,52 @@ from hermes_constants import hermes_home_key
 
 logger = logging.getLogger(__name__)
 
+
+def _make_plugin_host_authority():
+    """Create a one-time, closure-backed binding to original plugin-host code."""
+    binding = None
+    lock = threading.Lock()
+
+    def bind(host_globals: dict, methods: dict[tuple[str, str], Callable]) -> None:
+        nonlocal binding
+        frozen_methods = {}
+        for key, method in methods.items():
+            codes = []
+            while method is not None:
+                code = getattr(method, "__code__", None)
+                if code is None:
+                    raise TypeError(f"Plugin host authority {key!r} is not callable")
+                codes.append(code)
+                method = getattr(method, "__wrapped__", None)
+            frozen_methods[key] = frozenset(codes)
+        candidate = (host_globals, frozen_methods)
+        with lock:
+            if binding is None:
+                binding = candidate
+                return
+            current_globals, current_methods = binding
+            if current_globals is not host_globals or current_methods != frozen_methods:
+                raise PermissionError("Plugin host authority is already bound")
+
+    def caller_allowed(frame, owner_name: str, method_names: tuple[str, ...]) -> bool:
+        current = binding
+        if current is None:
+            return False
+        host_globals, methods = current
+        if frame.f_globals is not host_globals:
+            return False
+        return any(
+            frame.f_code in methods.get((owner_name, method_name), ())
+            for method_name in method_names
+        )
+
+    return bind, caller_allowed
+
+
+_bind_plugin_host_authority, _plugin_host_caller_allowed = (
+    _make_plugin_host_authority()
+)
+
 # Cap on a tool error body; only trims runaway interpolated exceptions (static msgs are ~115 chars).
 _MAX_TOOL_ERROR_CHARS = 2048
 _TOOL_ERROR_TRUNCATION_MARKER = "… [truncated]"
@@ -937,23 +983,14 @@ class ToolRegistry:
     def _caller_is_plugin_host_method(
         owner_name: str,
         *method_names: str,
+        _caller_allowed=_plugin_host_caller_allowed,
     ) -> bool:
-        """Require an exact plugin-host code frame, not a forged module name."""
+        """Require an original, one-time-bound plugin-host code frame."""
         try:
             frame = sys._getframe(2)
-            module = sys.modules.get("hermes_cli.plugins")
-            owner = getattr(module, owner_name)
-            if frame.f_globals is not vars(module):
-                return False
-            for method_name in method_names:
-                method = getattr(owner, method_name)
-                while hasattr(method, "__wrapped__"):
-                    method = method.__wrapped__
-                if frame.f_code is method.__code__:
-                    return True
+            return _caller_allowed(frame, owner_name, method_names)
         except Exception:
             return False
-        return False
 
     def register(
         self,

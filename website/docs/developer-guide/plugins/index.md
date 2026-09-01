@@ -523,7 +523,10 @@ behalf; Hermes rejects those confused-deputy patterns even when the original
 plugin has operator consent.
 Registered tool entries and their authorization generations are immutable;
 replacement restoration is owned exclusively by the plugin host lifecycle.
-This loader-bound enforcement is media-delivery contract version 2.
+Hermes binds the original host method code objects once, before discovery, so
+changing names in the plugin-host module cannot inherit registration or
+restoration authority. This loader-bound enforcement is media-delivery
+contract version 2.
 - `ctx.get_config()` / `ctx.set_config()` access only this plugin's settings namespace; `ctx.state` stores plugin-owned runtime data under the active profile.
 - If this function crashes, the plugin is disabled but Hermes continues fine
 

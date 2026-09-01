@@ -119,6 +119,134 @@ def test_direct_restore_cannot_borrow_trusted_media_policy():
 
 
 class TestPluginMediaDeliveryAuthorization:
+    def test_replaced_host_verifier_global_cannot_construct_restore(self):
+        from hermes_cli import plugins as plugin_host
+
+        registry = ToolRegistry()
+        entry = ToolEntry(
+            "victim",
+            "victim_set",
+            {},
+            lambda *_args, **_kwargs: "",
+            None,
+            [],
+            False,
+            "",
+            "",
+        )
+        original = plugin_host._plugin_host_caller_allowed
+        try:
+            plugin_host._plugin_host_caller_allowed = lambda *_args: True
+            with pytest.raises(PermissionError, match="host lifecycle"):
+                plugin_host._ToolRegistrationRestore(
+                    registry,
+                    "victim",
+                    entry,
+                    registry.current_scope_key(),
+                )
+        finally:
+            plugin_host._plugin_host_caller_allowed = original
+
+    def test_replaced_host_restore_class_cannot_delete_a_tool(self):
+        from hermes_cli import plugins as plugin_host
+
+        registry = ToolRegistry()
+        entry = ToolEntry(
+            "victim",
+            "victim_set",
+            {},
+            lambda *_args, **_kwargs: "",
+            None,
+            [],
+            False,
+            "",
+            "",
+        )
+        registry._tools["victim"] = entry
+        original = plugin_host._ToolRegistrationRestore
+        audit_names = (
+            "_audit_registry",
+            "_audit_entry",
+            "_ForgedRestore",
+        )
+        try:
+            plugin_host._audit_registry = registry
+            plugin_host._audit_entry = entry
+            exec(
+                "class _ForgedRestore:\n"
+                "    def __call__(self):\n"
+                "        return _audit_registry.restore_registration(\n"
+                "            'victim', _audit_entry, None\n"
+                "        )\n",
+                plugin_host.__dict__,
+            )
+            plugin_host._ToolRegistrationRestore = plugin_host._ForgedRestore
+
+            with pytest.raises(PermissionError, match="plugin host lifecycle"):
+                plugin_host._ForgedRestore()()
+        finally:
+            plugin_host._ToolRegistrationRestore = original
+            for name in audit_names:
+                plugin_host.__dict__.pop(name, None)
+
+        assert registry.get_entry("victim") is entry
+
+    def test_replaced_plugin_context_cannot_use_a_stolen_media_permit(self):
+        from hermes_cli import plugins as plugin_host
+        from tools.registry import _PluginOverridePolicy, _PluginRegistrationPermit
+
+        registry = ToolRegistry()
+        scope = registry.current_scope_key()
+        namespace = "hermes_plugins.trusted"
+        policy = _PluginOverridePolicy(True, media_delivery_allowed=True)
+        permit = _PluginRegistrationPermit()
+        registry._plugin_override_policy[(scope, namespace)] = policy
+        registry._plugin_module_scopes[namespace] = {scope}
+        registry._plugin_registration_permits[permit] = (
+            scope,
+            namespace,
+            policy,
+        )
+        original = plugin_host.PluginContext
+        audit_names = (
+            "_audit_registry",
+            "_audit_scope",
+            "_audit_namespace",
+            "_audit_policy",
+            "_audit_permit",
+            "_ForgedContext",
+        )
+        try:
+            plugin_host._audit_registry = registry
+            plugin_host._audit_scope = scope
+            plugin_host._audit_namespace = namespace
+            plugin_host._audit_policy = policy
+            plugin_host._audit_permit = permit
+            exec(
+                "class _ForgedContext:\n"
+                "    def register_tool(self):\n"
+                "        return _audit_registry.register(\n"
+                "            name='forged_media', toolset='forged', schema={},\n"
+                "            handler=lambda *_args, **_kwargs: '',\n"
+                "            scope=_audit_scope, override=True,\n"
+                "            auto_deliver_media=True,\n"
+                "            _plugin_namespace=_audit_namespace,\n"
+                "            _plugin_policy=_audit_policy,\n"
+                "            _plugin_permit=_audit_permit,\n"
+                "        )\n",
+                plugin_host.__dict__,
+            )
+            plugin_host.PluginContext = plugin_host._ForgedContext
+
+            with pytest.raises(PermissionError, match="plugin host"):
+                plugin_host._ForgedContext().register_tool()
+        finally:
+            plugin_host.PluginContext = original
+            for name in audit_names:
+                plugin_host.__dict__.pop(name, None)
+
+        assert registry.get_entry("forged_media", scope=scope) is None
+
     def test_forged_host_module_globals_cannot_create_policy(self):
         from hermes_cli import plugins as plugins_mod
 

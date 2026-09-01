@@ -78,6 +78,10 @@ from hermes_cli.relay_plugin_cutover import (
     RELAY_PLUGINS_CONFIG_ENV,
     legacy_relay_plugin_keys,
 )
+from tools.registry import (
+    _bind_plugin_host_authority,
+    _plugin_host_caller_allowed,
+)
 
 
 def get_bundled_plugins_dir() -> Path:
@@ -118,26 +122,24 @@ _REPLACEMENT_COORDINATOR_GLOBALS = vars(
 )
 
 
-def _caller_is_exact_plugin_host_method(
-    owner_name: str,
-    *method_names: str,
-) -> bool:
-    """Require an exact host method code object, including wrapped methods."""
-    try:
-        caller = sys._getframe(2)
-        module = sys.modules[__name__]
-        if caller.f_globals is not vars(module):
-            return False
-        owner = getattr(module, owner_name)
-        for method_name in method_names:
-            method = getattr(owner, method_name)
-            while method is not None:
-                if caller.f_code is method.__code__:
-                    return True
-                method = getattr(method, "__wrapped__", None)
-    except Exception:
-        return False
-    return False
+def _plugin_host_only(owner_name: str, *method_names: str, error: str):
+    """Guard a private lifecycle method with the frozen host-code binding."""
+    caller_allowed = _plugin_host_caller_allowed
+
+    def decorate(method):
+        @wraps(method)
+        def guarded(*args, **kwargs):
+            try:
+                allowed = caller_allowed(sys._getframe(1), owner_name, method_names)
+            except Exception:
+                allowed = False
+            if not allowed:
+                raise PermissionError(error)
+            return method(*args, **kwargs)
+
+        return guarded
+
+    return decorate
 
 
 def _snapshot_replacement_lineage(lease: Any) -> tuple[Any, tuple[tuple, ...]]:
@@ -205,6 +207,11 @@ class _PluginPolicyRestore:
         "_scope",
     )
 
+    @_plugin_host_only(
+        "PluginManager",
+        "_register_plugin_tool_policy",
+        error="Plugin tool policy restoration requires the host lifecycle.",
+    )
     def __init__(
         self,
         registry: Any,
@@ -212,12 +219,6 @@ class _PluginPolicyRestore:
         current: Any,
         scope: str,
     ) -> None:
-        if not _caller_is_exact_plugin_host_method(
-            "PluginManager", "_register_plugin_tool_policy"
-        ):
-            raise PermissionError(
-                "Plugin tool policy restoration requires the host lifecycle."
-            )
         self._registry = registry
         self._module_name = module_name
         self._current = current
@@ -226,13 +227,12 @@ class _PluginPolicyRestore:
         self._previous: Any = None
         self._predecessors: tuple[tuple, ...] = ()
 
+    @_plugin_host_only(
+        "PluginManager",
+        "_register_plugin_tool_policy",
+        error="Plugin tool policy restoration requires the host lifecycle.",
+    )
     def _bind_lifecycle_lease(self, lease: Any) -> None:
-        if not _caller_is_exact_plugin_host_method(
-            "PluginManager", "_register_plugin_tool_policy"
-        ):
-            raise PermissionError(
-                "Plugin tool policy restoration requires the host lifecycle."
-            )
         if self._lease is not None:
             raise PermissionError("Plugin tool policy restoration is already bound.")
         if (
@@ -286,6 +286,11 @@ class _ToolRegistrationRestore:
         "_scope",
     )
 
+    @_plugin_host_only(
+        "PluginContext",
+        "register_tool",
+        error="Tool registration restoration requires the host lifecycle.",
+    )
     def __init__(
         self,
         registry: Any,
@@ -293,10 +298,6 @@ class _ToolRegistrationRestore:
         current: Any,
         scope: str,
     ) -> None:
-        if not _caller_is_exact_plugin_host_method("PluginContext", "register_tool"):
-            raise PermissionError(
-                "Tool registration restoration requires the host lifecycle."
-            )
         self._registry = registry
         self._name = name
         self._current = current
@@ -305,13 +306,12 @@ class _ToolRegistrationRestore:
         self._previous: Any = None
         self._predecessors: tuple[tuple, ...] = ()
 
+    @_plugin_host_only(
+        "PluginContext",
+        "_track_replacement",
+        error="Tool registration restoration requires the host lifecycle.",
+    )
     def _bind_lifecycle_lease(self, lease: Any) -> None:
-        if not _caller_is_exact_plugin_host_method(
-            "PluginContext", "_track_replacement"
-        ):
-            raise PermissionError(
-                "Tool registration restoration requires the host lifecycle."
-            )
         if self._lease is not None:
             raise PermissionError("Tool registration restoration is already bound.")
         if (
@@ -6558,6 +6558,26 @@ class PluginManager:
     def remove_plugin_skill(self, qualified_name: str) -> None:
         """Remove a stale registry entry (silently ignores missing keys)."""
         self._plugin_skills.pop(qualified_name, None)
+
+
+_bind_plugin_host_authority(
+    globals(),
+    {
+        ("PluginContext", "_track_replacement"): PluginContext._track_replacement,
+        ("PluginContext", "register_tool"): PluginContext.register_tool,
+        ("PluginManager", "_load_plugin_scoped"): PluginManager._load_plugin_scoped,
+        (
+            "PluginManager",
+            "_register_deferred_platform_tools",
+        ): PluginManager._register_deferred_platform_tools,
+        (
+            "PluginManager",
+            "_register_plugin_tool_policy",
+        ): PluginManager._register_plugin_tool_policy,
+        ("_PluginPolicyRestore", "__call__"): _PluginPolicyRestore.__call__,
+        ("_ToolRegistrationRestore", "__call__"): _ToolRegistrationRestore.__call__,
+    },
+)
 
 
 # ---------------------------------------------------------------------------
