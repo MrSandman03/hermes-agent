@@ -248,6 +248,7 @@ def _save_discovery_cache(cache: Dict[str, list]) -> None:
 
 
 _UNSET_REGISTRATION_OWNER = object()
+_HOST_REGISTRATION_OWNER = object()
 
 
 class ToolEntry:
@@ -890,7 +891,7 @@ class ToolRegistry:
         """
         if entry is None:
             return False
-        return entry._registration_owner is None
+        return entry._registration_owner is _HOST_REGISTRATION_OWNER
 
     def _plugin_owner_of(self, handler: Callable) -> Optional[str]:
         """Return the plugin module namespace that defined *handler*, or None
@@ -1197,7 +1198,11 @@ class ToolRegistry:
                 dynamic_schema_overrides=dynamic_schema_overrides,
                 auto_deliver_media=auto_deliver_media,
                 media_delivery_policy=media_policy,
-                registration_owner=owner,
+            )
+            object.__setattr__(
+                registered,
+                "_registration_owner",
+                _HOST_REGISTRATION_OWNER if owner is None else owner,
             )
             target[name] = registered
             if media_policy is not None:
