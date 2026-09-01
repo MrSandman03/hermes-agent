@@ -208,23 +208,23 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
-        "auto_deliver_media", "_media_delivery_policy",
+        "auto_deliver_media", "_media_delivery_policy", "_sealed",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
                  max_result_size_chars=None, dynamic_schema_overrides=None,
                  auto_deliver_media=False, media_delivery_policy=None):
-        self.name = name
-        self.toolset = toolset
-        self.schema = schema
-        self.handler = handler
-        self.check_fn = check_fn
-        self.requires_env = requires_env
-        self.is_async = is_async
-        self.description = description
-        self.emoji = emoji
-        self.max_result_size_chars = max_result_size_chars
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "toolset", toolset)
+        object.__setattr__(self, "schema", schema)
+        object.__setattr__(self, "handler", handler)
+        object.__setattr__(self, "check_fn", check_fn)
+        object.__setattr__(self, "requires_env", requires_env)
+        object.__setattr__(self, "is_async", is_async)
+        object.__setattr__(self, "description", description)
+        object.__setattr__(self, "emoji", emoji)
+        object.__setattr__(self, "max_result_size_chars", max_result_size_chars)
         # Optional zero-arg callable returning a dict of schema overrides
         # applied at get_definitions() time. Use for fields that depend on
         # runtime config (e.g. delegate_task's description must reflect the
@@ -232,25 +232,39 @@ class ToolEntry:
         # so the model isn't told the wrong limits). The callable is invoked
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
-        self.dynamic_schema_overrides = dynamic_schema_overrides
+        object.__setattr__(self, "dynamic_schema_overrides", dynamic_schema_overrides)
         # Trusted producer contract: the gateway may recover MEDIA directives
         # from this tool's current-turn result when the model omits them.
-        self.auto_deliver_media = bool(auto_deliver_media)
+        object.__setattr__(self, "auto_deliver_media", bool(auto_deliver_media))
         # Plugin media authority is generation-bound. Core/built-in producers
         # have no policy object; plugin producers retain the exact policy
         # identity that authorized their registration so revocation can fail
         # closed even if a plugin bypasses PluginContext's ownership ledger.
-        self._media_delivery_policy = media_delivery_policy
+        object.__setattr__(self, "_media_delivery_policy", media_delivery_policy)
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name, value):
+        if getattr(self, "_sealed", False):
+            raise AttributeError("ToolEntry registrations are immutable")
+        object.__setattr__(self, name, value)
 
 
 class _PluginOverridePolicy:
     """Identity-bearing tool authorization record for one plugin generation."""
 
-    __slots__ = ("allowed", "media_delivery_allowed")
+    __slots__ = ("allowed", "media_delivery_allowed", "_sealed")
 
     def __init__(self, allowed: bool, *, media_delivery_allowed: bool = False) -> None:
-        self.allowed = bool(allowed)
-        self.media_delivery_allowed = bool(media_delivery_allowed)
+        object.__setattr__(self, "allowed", bool(allowed))
+        object.__setattr__(
+            self, "media_delivery_allowed", bool(media_delivery_allowed)
+        )
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name, value):
+        if getattr(self, "_sealed", False):
+            raise AttributeError("Plugin authorization policies are immutable")
+        object.__setattr__(self, name, value)
 
 
 class _PluginRegistrationPermit:
@@ -793,10 +807,23 @@ class ToolRegistry:
         if policy is None:
             return False
         with self._lock:
-            return bool(
-                policy.media_delivery_allowed
-                and policy in self._plugin_override_policy.values()
-            )
+            if (
+                not policy.media_delivery_allowed
+                or policy not in self._plugin_override_policy.values()
+            ):
+                return False
+            for scope, name, current, _previous in self._plugin_media_registrations.get(
+                policy, ()
+            ):
+                if current is not entry:
+                    continue
+                target = (
+                    self._tools
+                    if scope is None
+                    else self._scoped_tools.get(scope, {})
+                )
+                return target.get(name) is entry
+            return False
 
     def _plugin_owner_of(self, handler: Callable) -> Optional[str]:
         """Return the plugin module namespace that defined *handler*, or None
@@ -1203,6 +1230,12 @@ class ToolRegistry:
         newer entry under the same name, in which case unloading this entry
         must leave the newer entry untouched.
         """
+        if not self._caller_is_plugin_host_method(
+            "_ToolRegistrationRestore", "__call__"
+        ):
+            raise PermissionError(
+                "Tool registrations may only be restored by the plugin host lifecycle."
+            )
         with self._lock:
             target = (
                 self._tools

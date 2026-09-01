@@ -33,6 +33,17 @@ def _host_restore_plugin_policy(registry, *args, **kwargs):
         return registry.restore_plugin_override_policy(*args, **kwargs)
 
 
+def _host_restore_tool_registration(registry, *args, **kwargs):
+    from unittest.mock import patch
+
+    from tools.registry import ToolRegistry
+
+    with patch.object(
+        ToolRegistry, "_caller_is_plugin_host_method", return_value=True
+    ):
+        return registry.restore_registration(*args, **kwargs)
+
+
 def _host_bind_plugin_context(registry, namespace, policy, *, scope):
     from unittest.mock import patch
 
@@ -352,7 +363,9 @@ def test_targeted_unload_does_not_resurrect_an_older_tool_override():
     finally:
         current = registry.snapshot_registration(name, scope=scope)
         if current is not None:
-            registry.restore_registration(name, current, previous, scope=scope)
+            _host_restore_tool_registration(
+                registry, name, current, previous, scope=scope
+            )
 
 
 def test_rejected_tool_registration_does_not_claim_global_fallback():
@@ -393,7 +406,7 @@ def test_rejected_tool_registration_does_not_claim_global_fallback():
         assert registry.snapshot_registration(name) is base_entry
     finally:
         if base_entry is not None:
-            registry.restore_registration(name, base_entry, previous)
+            _host_restore_tool_registration(registry, name, base_entry, previous)
 
 
 def test_plugin_context_cannot_shadow_same_toolset_global_with_core_callable():
@@ -428,7 +441,7 @@ def test_plugin_context_cannot_shadow_same_toolset_global_with_core_callable():
         assert registry.snapshot_registration(name, scope=manager.scope_key) is None
     finally:
         if base_entry is not None:
-            registry.restore_registration(name, base_entry, previous)
+            _host_restore_tool_registration(registry, name, base_entry, previous)
 
 
 def test_rejected_tool_registration_does_not_claim_local_predecessor():
@@ -470,7 +483,9 @@ def test_rejected_tool_registration_does_not_claim_local_predecessor():
     finally:
         current = registry.snapshot_registration(name, scope=scope)
         if current is not None:
-            registry.restore_registration(name, current, previous, scope=scope)
+            _host_restore_tool_registration(
+                registry, name, current, previous, scope=scope
+            )
 
 
 def test_scoped_plugin_cannot_deregister_a_process_global_tool():
@@ -549,8 +564,12 @@ def test_shared_entrypoint_module_uses_the_active_profile_scope(tmp_path):
 
     entry_a = registry.snapshot_registration("shared_entrypoint_a", scope=home_a)
     assert entry_a is not None
-    assert registry.restore_registration(
-        "shared_entrypoint_a", entry_a, None, scope=home_a
+    assert _host_restore_tool_registration(
+        registry,
+        "shared_entrypoint_a",
+        entry_a,
+        None,
+        scope=home_a,
     )
     assert registry.snapshot_registration("shared_entrypoint_a", scope=home_a) is None
     assert registry.snapshot_registration("shared_entrypoint_b", scope=home_b) is not None

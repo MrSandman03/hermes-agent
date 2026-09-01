@@ -7,6 +7,7 @@ layer; this helper exists to strip structural framing tokens the model
 itself might react to (XML role tags, CDATA, markdown code fences) and to
 cap pathological lengths.
 """
+
 from __future__ import annotations
 
 from model_tools import _sanitize_tool_error, _TOOL_ERROR_MAX_LEN
@@ -19,15 +20,21 @@ class TestRoleTagStripping:
         assert "</tool_call>" not in out
         assert "bad injected happened" in out
 
-
     def test_strips_role_tags(self):
         # Each of these should be stripped
-        for tag in ("system", "assistant", "user", "result", "response", "output", "input"):
+        for tag in (
+            "system",
+            "assistant",
+            "user",
+            "result",
+            "response",
+            "output",
+            "input",
+        ):
             raw = f"prefix <{tag}>hi</{tag}> suffix"
             out = _sanitize_tool_error(raw)
             assert f"<{tag}>" not in out, f"failed to strip <{tag}>"
             assert f"</{tag}>" not in out, f"failed to strip </{tag}>"
-
 
     def test_unrelated_xml_kept(self):
         # We intentionally only strip the role-like tag whitelist, not all XML
@@ -42,12 +49,10 @@ class TestCDATAStripping:
         assert "]]>" not in out
 
 
-
 class TestCodeFenceStripping:
     def test_strips_leading_fence_with_lang(self):
-        out = _sanitize_tool_error("```json\n{\"x\": 1}")
+        out = _sanitize_tool_error('```json\n{"x": 1}')
         assert not out.replace("[TOOL_ERROR] ", "").startswith("```")
-
 
     def test_strips_bare_fence(self):
         out = _sanitize_tool_error("```\nstuff")
@@ -59,18 +64,15 @@ class TestTruncation:
         long = "A" * (_TOOL_ERROR_MAX_LEN * 2)
         out = _sanitize_tool_error(long)
         # Total length is prefix + truncated body
-        body = out[len("[TOOL_ERROR] "):]
+        body = out[len("[TOOL_ERROR] ") :]
         assert len(body) == _TOOL_ERROR_MAX_LEN
         assert body.endswith("...")
-
 
 
 class TestEnvelope:
     def test_wraps_with_prefix(self):
         out = _sanitize_tool_error("oh no")
         assert out.startswith("[TOOL_ERROR] ")
-
-
 
 
 class TestHandleFunctionCallIntegration:
@@ -86,7 +88,7 @@ class TestHandleFunctionCallIntegration:
     def test_exception_path_error_is_sanitized(self):
         import json
         from model_tools import handle_function_call
-        from tools.registry import registry as _registry
+        from tools.registry import ToolEntry, registry as _registry
 
         # Force a known tool to raise with a payload containing role tags.
         def boom(_args, **_kwargs):
@@ -95,12 +97,25 @@ class TestHandleFunctionCallIntegration:
         all_tools = _registry.get_all_tool_names()
         assert all_tools, "no tools registered — test environment broken"
         target = all_tools[0]
-        original = _registry._tools[target].handler
-        _registry._tools[target].handler = boom
+        original = _registry._tools[target]
+        replacement = ToolEntry(
+            name=original.name,
+            toolset=original.toolset,
+            schema=original.schema,
+            handler=boom,
+            check_fn=original.check_fn,
+            requires_env=original.requires_env,
+            is_async=original.is_async,
+            description=original.description,
+            emoji=original.emoji,
+            max_result_size_chars=original.max_result_size_chars,
+            dynamic_schema_overrides=original.dynamic_schema_overrides,
+        )
+        _registry._tools[target] = replacement
         try:
             result_str = handle_function_call(target, {})
         finally:
-            _registry._tools[target].handler = original
+            _registry._tools[target] = original
 
         payload = json.loads(result_str)
         assert "error" in payload, payload
