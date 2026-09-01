@@ -8,7 +8,53 @@ from threading import Event
 from time import monotonic, sleep
 from types import MethodType
 
+import pytest
 import yaml
+
+
+def _host_register_plugin_policy(registry, *args, **kwargs):
+    from tests.tools.test_registry import _host_registry_call
+
+    with _host_registry_call(registry):
+        return registry.register_plugin_override_policy(*args, **kwargs)
+
+
+def _host_restore_plugin_policy(registry, *args, **kwargs):
+    from tests.tools.test_registry import _host_registry_call
+
+    with _host_registry_call(registry):
+        return registry.restore_plugin_override_policy(*args, **kwargs)
+
+
+def _host_restore_tool_registration(registry, *args, **kwargs):
+    from tests.tools.test_registry import _host_registry_call
+
+    with _host_registry_call(registry):
+        return registry.restore_registration(*args, **kwargs)
+
+
+def _host_bind_plugin_context(registry, namespace, policy, *, scope):
+    from tests.tools.test_registry import _host_registry_call
+
+    with _host_registry_call(registry):
+        return registry._bind_plugin_registration_context(
+            namespace, policy, scope=scope
+        )
+
+
+def _host_prepare_tool_context(context) -> None:
+    from tools.registry import registry
+
+    manager = context._manager
+    namespace = manager._policy_module_name(context.manifest)
+    policy = _host_register_plugin_policy(
+        registry, namespace, False, scope=manager.scope_key
+    )
+    context._tool_policy_namespace = namespace
+    context._tool_policy = policy
+    context._tool_registration_permit = _host_bind_plugin_context(
+        registry, namespace, policy, scope=manager.scope_key
+    )
 
 
 def _write_plugin(hermes_home: Path) -> None:
@@ -272,6 +318,8 @@ def test_targeted_unload_does_not_resurrect_an_older_tool_override():
     manager_b = PluginManager(scope_key=scope)
     context_a = PluginContext(PluginManifest(name="tool_a", key="tool_a"), manager_a)
     context_b = PluginContext(PluginManifest(name="tool_b", key="tool_b"), manager_b)
+    _host_prepare_tool_context(context_a)
+    _host_prepare_tool_context(context_b)
 
     def register(context, marker):
         return context.register_tool(
@@ -300,7 +348,88 @@ def test_targeted_unload_does_not_resurrect_an_older_tool_override():
     finally:
         current = registry.snapshot_registration(name, scope=scope)
         if current is not None:
-            registry.restore_registration(name, current, previous, scope=scope)
+            _host_restore_tool_registration(
+                registry, name, current, previous, scope=scope
+            )
+
+
+def test_stolen_tool_restore_callback_rejects_attacker_created_lease():
+    """A public coordinator lease cannot drive a host-bound tool inverse."""
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+    from registration_lifecycle import replacement_coordinator
+    from tools.registry import ToolEntry, registry
+
+    name = "ledger_stolen_restore_callback"
+    scope = registry.current_scope_key()
+    previous = registry.snapshot_registration(name, scope=scope)
+    manager = PluginManager(scope_key=scope)
+    context = PluginContext(
+        PluginManifest(name="lease_guard", key="lease_guard"), manager
+    )
+    _host_prepare_tool_context(context)
+    namespace = context._tool_policy_namespace
+    policy = context._tool_policy
+    handle = context.register_tool(
+        name=name,
+        toolset="lease_guard",
+        schema={
+            "name": name,
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=lambda _args: "legitimate",
+    )
+    assert handle is not None
+    legitimate_lease = handle.release.__self__
+    current = registry.snapshot_registration(name, scope=scope)
+    assert current is legitimate_lease.current
+    forged = ToolEntry(
+        name=name,
+        toolset="lease_guard",
+        schema={
+            "name": name,
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=lambda _args: "forged",
+        check_fn=None,
+        requires_env=[],
+        is_async=False,
+        description="",
+        emoji="",
+    )
+    attacker_lease = replacement_coordinator.acquire(
+        legitimate_lease.slot,
+        current=current,
+        previous=forged,
+        restore=legitimate_lease.restore,
+    )
+
+    try:
+        with pytest.raises(PermissionError, match="host lifecycle"):
+            attacker_lease.dispose()
+        assert registry.snapshot_registration(name, scope=scope) is current
+        legitimate_lease.previous = forged
+        with pytest.raises(PermissionError, match="host lifecycle"):
+            handle.dispose()
+        assert registry.snapshot_registration(name, scope=scope) is current
+    finally:
+        manager.unload("lease_guard")
+        if namespace is not None and policy is not None:
+            _host_restore_plugin_policy(
+                registry,
+                namespace,
+                policy,
+                None,
+                scope=scope,
+            )
+        restored = registry.snapshot_registration(name, scope=scope)
+        if restored is not previous and restored is not None:
+            _host_restore_tool_registration(
+                registry,
+                name,
+                restored,
+                previous,
+                scope=scope,
+            )
 
 
 def test_rejected_tool_registration_does_not_claim_global_fallback():
@@ -341,7 +470,7 @@ def test_rejected_tool_registration_does_not_claim_global_fallback():
         assert registry.snapshot_registration(name) is base_entry
     finally:
         if base_entry is not None:
-            registry.restore_registration(name, base_entry, previous)
+            _host_restore_tool_registration(registry, name, base_entry, previous)
 
 
 def test_plugin_context_cannot_shadow_same_toolset_global_with_core_callable():
@@ -376,7 +505,7 @@ def test_plugin_context_cannot_shadow_same_toolset_global_with_core_callable():
         assert registry.snapshot_registration(name, scope=manager.scope_key) is None
     finally:
         if base_entry is not None:
-            registry.restore_registration(name, base_entry, previous)
+            _host_restore_tool_registration(registry, name, base_entry, previous)
 
 
 def test_rejected_tool_registration_does_not_claim_local_predecessor():
@@ -395,6 +524,8 @@ def test_rejected_tool_registration_does_not_claim_local_predecessor():
     manager_b = PluginManager(scope_key=scope)
     context_a = PluginContext(PluginManifest(name="local_owner", key="local_owner"), manager_a)
     context_b = PluginContext(PluginManifest(name="false_owner", key="false_owner"), manager_b)
+    _host_prepare_tool_context(context_a)
+    _host_prepare_tool_context(context_b)
     try:
         assert context_a.register_tool(
             name=name,
@@ -416,7 +547,9 @@ def test_rejected_tool_registration_does_not_claim_local_predecessor():
     finally:
         current = registry.snapshot_registration(name, scope=scope)
         if current is not None:
-            registry.restore_registration(name, current, previous, scope=scope)
+            _host_restore_tool_registration(
+                registry, name, current, previous, scope=scope
+            )
 
 
 def test_scoped_plugin_cannot_deregister_a_process_global_tool():
@@ -436,12 +569,14 @@ def test_scoped_plugin_cannot_deregister_a_process_global_tool():
         handler=lambda args, **kwargs: "base",
     )
     module_name = "hermes_plugins.scoped_cleanup"
-    registry.register_plugin_override_policy(
+    policy = _host_register_plugin_policy(
+        registry,
         module_name, True, scope="/profiles/isolated"
     )
-
-    with patch.object(ToolRegistry, "_caller_module", return_value=module_name):
-        with pytest.raises(PermissionError, match="process-global"):
+    with patch.object(
+        ToolRegistry, "_caller_module", return_value=module_name
+    ):
+        with pytest.raises(PermissionError, match="through the host registry"):
             registry.deregister(name)
 
     assert registry.snapshot_registration(name) is not None
@@ -459,10 +594,12 @@ def test_shared_entrypoint_module_uses_the_active_profile_scope(tmp_path):
     home_a = str((tmp_path / "entrypoint-a").resolve())
     home_b = str((tmp_path / "entrypoint-b").resolve())
     home_c = str((tmp_path / "entrypoint-c").resolve())
-    policy_a = registry.register_plugin_override_policy(
+    policy_a = _host_register_plugin_policy(
+        registry,
         module_name, False, scope=home_a
     )
-    policy_b = registry.register_plugin_override_policy(
+    policy_b = _host_register_plugin_policy(
+        registry,
         module_name, False, scope=home_b
     )
     handler = eval("lambda args, **kwargs: 'shared'", {"__name__": module_name})
@@ -489,23 +626,26 @@ def test_shared_entrypoint_module_uses_the_active_profile_scope(tmp_path):
     assert registry.snapshot_registration("shared_entrypoint_b", scope=home_b) is not None
     assert registry.snapshot_registration("shared_entrypoint_b") is None
 
-    from unittest.mock import patch
-
-    token = set_hermes_home_override(home_a)
-    try:
-        with patch.object(ToolRegistry, "_caller_module", return_value=module_name):
-            registry.deregister("shared_entrypoint_a")
-    finally:
-        reset_hermes_home_override(token)
+    entry_a = registry.snapshot_registration("shared_entrypoint_a", scope=home_a)
+    assert entry_a is not None
+    assert _host_restore_tool_registration(
+        registry,
+        "shared_entrypoint_a",
+        entry_a,
+        None,
+        scope=home_a,
+    )
     assert registry.snapshot_registration("shared_entrypoint_a", scope=home_a) is None
     assert registry.snapshot_registration("shared_entrypoint_b", scope=home_b) is not None
 
     # Policy unload revokes authorization but durable scope attribution keeps
     # a stale delayed callback out of the process-global registry.
-    registry.restore_plugin_override_policy(
+    _host_restore_plugin_policy(
+        registry,
         module_name, policy_a, None, scope=home_a
     )
-    registry.restore_plugin_override_policy(
+    _host_restore_plugin_policy(
+        registry,
         module_name, policy_b, None, scope=home_b
     )
     register_in(home_a, "shared_entrypoint_stale")
@@ -525,7 +665,7 @@ def test_decorated_plugin_callable_keeps_its_defining_module_scope(tmp_path):
     registry = ToolRegistry()
     module_name = "third_party.decorated_plugin"
     scope = str((tmp_path / "decorated-profile").resolve())
-    registry.register_plugin_override_policy(module_name, False, scope=scope)
+    _host_register_plugin_policy(registry, module_name, False, scope=scope)
     namespace = {"__name__": module_name, "functools": functools}
     exec(
         "@functools.wraps(str)\n"
@@ -557,8 +697,9 @@ def test_entrypoint_policy_uses_the_most_specific_module_prefix(tmp_path):
     registry = ToolRegistry()
     broad_scope = str((tmp_path / "broad").resolve())
     narrow_scope = str((tmp_path / "narrow").resolve())
-    registry.register_plugin_override_policy("vendor", True, scope=broad_scope)
-    registry.register_plugin_override_policy(
+    _host_register_plugin_policy(registry, "vendor", True, scope=broad_scope)
+    _host_register_plugin_policy(
+        registry,
         "vendor.plugin", False, scope=narrow_scope
     )
     handler = eval(
@@ -1120,7 +1261,8 @@ def test_direct_plugin_platform_registration_infers_immutable_scope(tmp_path):
     home_a = str((tmp_path / "direct-a").resolve())
     home_b = tmp_path / "direct-b"
     module_name = "company.hermes.direct_platform_probe"
-    policy = tool_registry.register_plugin_override_policy(
+    policy = _host_register_plugin_policy(
+        tool_registry,
         module_name, False, scope=home_a
     )
     factory = eval(
@@ -1159,7 +1301,8 @@ def test_direct_plugin_platform_registration_infers_immutable_scope(tmp_path):
             platform_registry.restore_registration(
                 name, current_global, previous_global
             )
-        tool_registry.restore_plugin_override_policy(
+        _host_restore_plugin_policy(
+            tool_registry,
             module_name, policy, None, scope=home_a
         )
 

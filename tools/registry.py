@@ -29,6 +29,52 @@ from hermes_constants import hermes_home_key
 
 logger = logging.getLogger(__name__)
 
+
+def _make_plugin_host_authority():
+    """Create a one-time, closure-backed binding to original plugin-host code."""
+    binding = None
+    lock = threading.Lock()
+
+    def bind(host_globals: dict, methods: dict[tuple[str, str], Callable]) -> None:
+        nonlocal binding
+        frozen_methods = {}
+        for key, method in methods.items():
+            codes = []
+            while method is not None:
+                code = getattr(method, "__code__", None)
+                if code is None:
+                    raise TypeError(f"Plugin host authority {key!r} is not callable")
+                codes.append(code)
+                method = getattr(method, "__wrapped__", None)
+            frozen_methods[key] = frozenset(codes)
+        candidate = (host_globals, frozen_methods)
+        with lock:
+            if binding is None:
+                binding = candidate
+                return
+            current_globals, current_methods = binding
+            if current_globals is not host_globals or current_methods != frozen_methods:
+                raise PermissionError("Plugin host authority is already bound")
+
+    def caller_allowed(frame, owner_name: str, method_names: tuple[str, ...]) -> bool:
+        current = binding
+        if current is None:
+            return False
+        host_globals, methods = current
+        if frame.f_globals is not host_globals:
+            return False
+        return any(
+            frame.f_code in methods.get((owner_name, method_name), ())
+            for method_name in method_names
+        )
+
+    return bind, caller_allowed
+
+
+_bind_plugin_host_authority, _plugin_host_caller_allowed = (
+    _make_plugin_host_authority()
+)
+
 # Cap on a tool error body; only trims runaway interpolated exceptions (static msgs are ~115 chars).
 _MAX_TOOL_ERROR_CHARS = 2048
 _TOOL_ERROR_TRUNCATION_MARKER = "… [truncated]"
@@ -208,21 +254,24 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
+        "auto_deliver_media", "_media_delivery_policy",
+        "_sealed",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
-        self.name = name
-        self.toolset = toolset
-        self.schema = schema
-        self.handler = handler
-        self.check_fn = check_fn
-        self.requires_env = requires_env
-        self.is_async = is_async
-        self.description = description
-        self.emoji = emoji
-        self.max_result_size_chars = max_result_size_chars
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 auto_deliver_media=False, media_delivery_policy=None):
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "toolset", toolset)
+        object.__setattr__(self, "schema", schema)
+        object.__setattr__(self, "handler", handler)
+        object.__setattr__(self, "check_fn", check_fn)
+        object.__setattr__(self, "requires_env", requires_env)
+        object.__setattr__(self, "is_async", is_async)
+        object.__setattr__(self, "description", description)
+        object.__setattr__(self, "emoji", emoji)
+        object.__setattr__(self, "max_result_size_chars", max_result_size_chars)
         # Optional zero-arg callable returning a dict of schema overrides
         # applied at get_definitions() time. Use for fields that depend on
         # runtime config (e.g. delegate_task's description must reflect the
@@ -230,16 +279,45 @@ class ToolEntry:
         # so the model isn't told the wrong limits). The callable is invoked
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
-        self.dynamic_schema_overrides = dynamic_schema_overrides
+        object.__setattr__(self, "dynamic_schema_overrides", dynamic_schema_overrides)
+        # Trusted producer contract: the gateway may recover MEDIA directives
+        # from this tool's current-turn result when the model omits them.
+        object.__setattr__(self, "auto_deliver_media", bool(auto_deliver_media))
+        # Plugin media authority is generation-bound. Core/built-in producers
+        # have no policy object; plugin producers retain the exact policy
+        # identity that authorized their registration so revocation can fail
+        # closed even if a plugin bypasses PluginContext's ownership ledger.
+        object.__setattr__(self, "_media_delivery_policy", media_delivery_policy)
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name, value):
+        if getattr(self, "_sealed", False):
+            raise AttributeError("ToolEntry registrations are immutable")
+        object.__setattr__(self, name, value)
 
 
 class _PluginOverridePolicy:
-    """Identity-bearing authorization record for one plugin generation."""
+    """Identity-bearing tool authorization record for one plugin generation."""
 
-    __slots__ = ("allowed",)
+    __slots__ = ("allowed", "media_delivery_allowed", "_sealed")
 
-    def __init__(self, allowed: bool) -> None:
-        self.allowed = bool(allowed)
+    def __init__(self, allowed: bool, *, media_delivery_allowed: bool = False) -> None:
+        object.__setattr__(self, "allowed", bool(allowed))
+        object.__setattr__(
+            self, "media_delivery_allowed", bool(media_delivery_allowed)
+        )
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name, value):
+        if getattr(self, "_sealed", False):
+            raise AttributeError("Plugin authorization policies are immutable")
+        object.__setattr__(self, name, value)
+
+
+class _PluginRegistrationPermit:
+    """Opaque host-issued permit for one plugin policy generation."""
+
+    __slots__ = ()
 
 
 # ---------------------------------------------------------------------------
@@ -464,10 +542,102 @@ class ToolRegistry:
         self._plugin_override_policy: Dict[
             tuple[Optional[str], str], _PluginOverridePolicy
         ] = {}
+        # Keep identity-conditional inverses under the authorizing policy so a
+        # policy unload/reload also revokes trusted-media registrations.
+        self._plugin_media_registrations: Dict[
+            _PluginOverridePolicy,
+            List[tuple[Optional[str], str, ToolEntry, Optional[ToolEntry]]],
+        ] = {}
+        # Retain opaque permits, never live PluginContext objects. A plugin
+        # inspecting registry internals cannot recover another plugin's facade
+        # and invoke it as a confused deputy.
+        self._plugin_registration_permits: Dict[
+            _PluginRegistrationPermit,
+            tuple[Optional[str], str, _PluginOverridePolicy],
+        ] = {}
         # Scope attribution stays durable after policy removal so delayed code
         # remains confined to the profile where its module was loaded.
         self._plugin_module_scopes: Dict[str, Set[Optional[str]]] = {}
         self._toolset_checks: Dict[str, Callable] = {}
+        host_entries: Set[ToolEntry] = set()
+        register_code = type(self).register.__code__
+        caller_allowed = _plugin_host_caller_allowed
+
+        def host_caller_allowed(*method_names: str) -> bool:
+            try:
+                caller = sys._getframe(2)
+                return caller_allowed(caller, method_names[0], method_names[1:])
+            except Exception:
+                return False
+
+        def host_registration_frame(frame) -> bool:
+            module_name = frame.f_globals.get("__name__", "")
+            module = sys.modules.get(module_name)
+            if (
+                not module_name.startswith("tools.")
+                or module is None
+                or module.__dict__ is not frame.f_globals
+            ):
+                return False
+            # ``exec(..., vars(tools_module))`` can impersonate a module's
+            # globals, but its code object still carries the exec filename.
+            module_file = getattr(module, "__file__", None)
+            if not module_file:
+                return False
+            spec = getattr(module, "__spec__", None)
+            if not getattr(spec, "_initializing", False):
+                return False
+            try:
+                return Path(frame.f_code.co_filename).resolve() == Path(
+                    module_file
+                ).resolve()
+            except (OSError, RuntimeError):
+                return False
+
+        def mark_host_entry(entry: ToolEntry) -> None:
+            try:
+                caller = sys._getframe(1)
+            except Exception:
+                return
+            if caller.f_code is register_code:
+                host_entries.add(entry)
+
+        def is_host_entry(entry: ToolEntry) -> bool:
+            return entry in host_entries
+
+        def is_auto_media_entry(entry: ToolEntry) -> bool:
+            if not entry.auto_deliver_media:
+                return False
+            policy = entry._media_delivery_policy
+            if policy is None:
+                return False
+            with self._lock:
+                if (
+                    not policy.media_delivery_allowed
+                    or policy not in self._plugin_override_policy.values()
+                ):
+                    return False
+                for scope, name, current, _previous in (
+                    self._plugin_media_registrations.get(policy, ())
+                ):
+                    if current is not entry:
+                        continue
+                    target = (
+                        self._tools
+                        if scope is None
+                        else self._scoped_tools.get(scope, {})
+                    )
+                    return target.get(name) is entry
+                return False
+
+        self._host_entry_marker = mark_host_entry
+        self._host_entry_verifier = is_host_entry
+        # Bind the public query per instance so replacing the class method
+        # cannot bypass this registry's closure-backed provenance set.
+        self.entry_is_host_registered = is_host_entry
+        self.entry_auto_delivers_media = is_auto_media_entry
+        self._host_caller_verifier = host_caller_allowed
+        self._host_registration_verifier = host_registration_frame
         self._toolset_aliases: Dict[str, str] = {}
         # MCP dynamic refresh can mutate the registry while other threads are
         # reading tool metadata, so keep mutations serialized and readers on
@@ -479,6 +649,18 @@ class ToolRegistry:
         # against it: a cache entry keyed on the generation is valid for as
         # long as the generation hasn't changed.
         self._generation: int = 0
+
+    def __setattr__(self, name, value):
+        if name in {
+            "_host_entry_marker",
+            "_host_entry_verifier",
+            "entry_is_host_registered",
+            "entry_auto_delivers_media",
+            "_host_caller_verifier",
+            "_host_registration_verifier",
+        } and name in self.__dict__:
+            raise AttributeError(f"Registry security hook {name!r} is immutable")
+        object.__setattr__(self, name, value)
 
     @staticmethod
     def current_scope_key() -> str:
@@ -600,6 +782,7 @@ class ToolRegistry:
         module_namespace: str,
         allowed: bool,
         *,
+        media_delivery_allowed: bool = False,
         scope: Optional[str] = None,
     ) -> _PluginOverridePolicy:
         """Bind a plugin module namespace to its current operator opt-in.
@@ -607,8 +790,20 @@ class ToolRegistry:
         The identity-bearing result lets plugin unload/reload revoke a stale
         authorization without losing durable module-to-profile attribution.
         """
+        if not self._host_caller_verifier(
+            "PluginManager", "_register_plugin_tool_policy"
+        ):
+            raise PermissionError(
+                "Plugin tool policies may only be created by the plugin host."
+            )
         with self._lock:
-            policy = _PluginOverridePolicy(allowed)
+            previous = self._plugin_override_policy.get((scope, module_namespace))
+            if previous is not None:
+                self._revoke_plugin_media_registrations(previous)
+            policy = _PluginOverridePolicy(
+                allowed,
+                media_delivery_allowed=media_delivery_allowed,
+            )
             self._plugin_override_policy[(scope, module_namespace)] = policy
             self._plugin_module_scopes.setdefault(module_namespace, set()).add(scope)
             return policy
@@ -632,25 +827,151 @@ class ToolRegistry:
         scope: Optional[str] = None,
     ) -> bool:
         """CAS-restore policy state while retaining durable scope attribution."""
+        if not self._host_caller_verifier("_PluginPolicyRestore", "__call__"):
+            raise PermissionError(
+                "Plugin tool policies may only be restored by the plugin host."
+            )
         with self._lock:
             key = (scope, module_namespace)
             if self._plugin_override_policy.get(key) is not current:
                 return False
+            self._revoke_plugin_media_registrations(current)
             if previous is None:
                 self._plugin_override_policy.pop(key, None)
             else:
                 self._plugin_override_policy[key] = previous
             return True
 
+    def _revoke_plugin_media_registrations(
+        self,
+        policy: _PluginOverridePolicy,
+    ) -> None:
+        """CAS-restore media tools authorized by one policy generation."""
+        registrations = self._plugin_media_registrations.pop(policy, [])
+        for permit, binding in list(self._plugin_registration_permits.items()):
+            if binding[2] is policy:
+                self._plugin_registration_permits.pop(permit, None)
+        changed = False
+        for scope, name, current, previous in reversed(registrations):
+            target = (
+                self._tools
+                if scope is None
+                else self._scoped_tools.get(scope, {})
+            )
+            if target.get(name) is not current:
+                continue
+            if previous is None:
+                target.pop(name, None)
+            else:
+                target[name] = previous
+            if scope is not None and not target:
+                self._scoped_tools.pop(scope, None)
+            changed = True
+        if changed:
+            self._generation += 1
+
+    def _bind_plugin_registration_context(
+        self,
+        module_namespace: str,
+        policy: _PluginOverridePolicy,
+        *,
+        scope: Optional[str] = None,
+    ) -> _PluginRegistrationPermit:
+        """Issue one opaque permit for an exact policy generation."""
+        if not self._host_caller_verifier(
+            "PluginManager",
+            "_register_deferred_platform_tools",
+            "_load_plugin_scoped",
+        ):
+            raise PermissionError(
+                "Plugin registration contexts may only be bound by the plugin host."
+            )
+        with self._lock:
+            current = self._plugin_policy(
+                scope,
+                module_namespace,
+                allow_global_fallback=False,
+            )
+            if current is not policy:
+                raise PermissionError(
+                    f"Plugin module {module_namespace!r} cannot bind a stale or "
+                    "missing policy generation."
+                )
+            permit = _PluginRegistrationPermit()
+            self._plugin_registration_permits[permit] = (
+                scope,
+                module_namespace,
+                policy,
+            )
+            return permit
+
+    def _plugin_policy(
+        self,
+        scope: Optional[str],
+        module_namespace: str,
+        *,
+        allow_global_fallback: bool = True,
+    ) -> Optional[_PluginOverridePolicy]:
+        policy = self._plugin_override_policy.get((scope, module_namespace))
+        if policy is None and scope is not None and allow_global_fallback:
+            policy = self._plugin_override_policy.get((None, module_namespace))
+        return policy
+
     def _plugin_override_allowed(
         self,
         scope: Optional[str],
         module_namespace: str,
     ) -> bool:
-        policy = self._plugin_override_policy.get((scope, module_namespace))
-        if policy is None and scope is not None:
-            policy = self._plugin_override_policy.get((None, module_namespace))
+        policy = self._plugin_policy(scope, module_namespace)
         return bool(policy and policy.allowed)
+
+    def _plugin_media_delivery_allowed(
+        self,
+        scope: Optional[str],
+        module_namespace: str,
+    ) -> bool:
+        policy = self._plugin_policy(
+            scope,
+            module_namespace,
+            allow_global_fallback=False,
+        )
+        return bool(policy and policy.media_delivery_allowed)
+
+    def entry_auto_delivers_media(self, entry: ToolEntry) -> bool:
+        """Return whether an entry still has live trusted-media authority."""
+        if not entry.auto_deliver_media:
+            return False
+        policy = entry._media_delivery_policy
+        if policy is None:
+            return False
+        with self._lock:
+            if (
+                not policy.media_delivery_allowed
+                or policy not in self._plugin_override_policy.values()
+            ):
+                return False
+            for scope, name, current, _previous in self._plugin_media_registrations.get(
+                policy, ()
+            ):
+                if current is not entry:
+                    continue
+                target = (
+                    self._tools
+                    if scope is None
+                    else self._scoped_tools.get(scope, {})
+                )
+                return target.get(name) is entry
+            return False
+
+    def entry_is_host_registered(self, entry: Optional[ToolEntry]) -> bool:
+        """Return whether this registry created *entry* as a host entry.
+
+        The provenance set is private to this registry instance. It is not
+        stored on the entry, where a plugin could copy a public marker.
+        """
+        if entry is None:
+            return False
+        return self._host_entry_verifier(entry)
 
     def _plugin_owner_of(self, handler: Callable) -> Optional[str]:
         """Return the plugin module namespace that defined *handler*, or None
@@ -760,6 +1081,19 @@ class ToolRegistry:
         except Exception:
             return ""
 
+    @staticmethod
+    def _caller_is_plugin_host_method(
+        owner_name: str,
+        *method_names: str,
+        _caller_allowed=_plugin_host_caller_allowed,
+    ) -> bool:
+        """Require an original, one-time-bound plugin-host code frame."""
+        try:
+            frame = sys._getframe(2)
+            return _caller_allowed(frame, owner_name, method_names)
+        except Exception:
+            return False
+
     def register(
         self,
         name: str,
@@ -775,6 +1109,11 @@ class ToolRegistry:
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
         scope: Optional[str] = None,
+        *,
+        auto_deliver_media: bool = False,
+        _plugin_namespace: Optional[str] = None,
+        _plugin_policy: Optional[_PluginOverridePolicy] = None,
+        _plugin_permit: object = None,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -784,12 +1123,78 @@ class ToolRegistry:
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
         """
+        caller_module = self._caller_module()
+        if _plugin_policy is not None and _plugin_namespace is None:
+            raise PermissionError(
+                "An explicit plugin policy requires its plugin namespace."
+            )
+        if (
+            _plugin_namespace is not None
+            or _plugin_policy is not None
+            or _plugin_permit is not None
+        ) and not self._host_caller_verifier("PluginContext", "register_tool"):
+            raise PermissionError(
+                "Explicit plugin policy bindings may only be supplied by the "
+                "plugin host."
+            )
         handler_owner = self._plugin_owner_of(handler)
-        caller_owner = self._plugin_namespace_of_module(self._caller_module())
-        owner = caller_owner or handler_owner
-        if scope is None and owner is not None:
-            scope = self._plugin_scope_of(owner)
+        caller_owner = self._plugin_namespace_of_module(caller_module)
+        owner = _plugin_namespace or caller_owner or handler_owner
+        if auto_deliver_media and owner is None:
+            raise PermissionError(
+                "Trusted media registration requires host-bound plugin authority."
+            )
+        if owner is not None:
+            bound_scope = self._plugin_scope_of(owner)
+            if scope is not None and scope != bound_scope:
+                raise PermissionError(
+                    f"Plugin module {owner!r} cannot register a tool in profile "
+                    f"scope {scope!r}; its active immutable scope is {bound_scope!r}."
+                )
+            scope = bound_scope
         with self._lock:
+            current_plugin_policy = (
+                self._plugin_policy(
+                    scope,
+                    owner,
+                    allow_global_fallback=False,
+                )
+                if owner is not None
+                else None
+            )
+            if (
+                _plugin_namespace is not None
+                and current_plugin_policy is not _plugin_policy
+            ):
+                raise PermissionError(
+                    f"Plugin module {_plugin_namespace!r} cannot register a tool "
+                    "with a stale or missing policy generation."
+                )
+            if owner is not None and (override or auto_deliver_media):
+                expected_binding = (scope, owner, current_plugin_policy)
+                if (
+                    _plugin_permit is None
+                    or self._plugin_registration_permits.get(_plugin_permit)
+                    != expected_binding
+                ):
+                    raise PermissionError(
+                        f"Plugin module {owner!r} cannot perform a privileged tool "
+                        "registration outside its host-bound PluginContext."
+                    )
+            media_policy = (
+                current_plugin_policy
+                if auto_deliver_media and owner is not None
+                else None
+            )
+            if (
+                auto_deliver_media
+                and owner is not None
+                and not (media_policy and media_policy.media_delivery_allowed)
+            ):
+                raise PermissionError(
+                    f"Plugin module {owner!r} cannot register a trusted media "
+                    "producer without gateway.media_delivery consent."
+                )
             target = (
                 self._tools
                 if scope is None
@@ -858,7 +1263,8 @@ class ToolRegistry:
                         name, toolset, existing.toolset,
                     )
                     return
-            target[name] = ToolEntry(
+            previous = target.get(name)
+            registered = ToolEntry(
                 name=name,
                 toolset=toolset,
                 schema=schema,
@@ -870,7 +1276,16 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                auto_deliver_media=auto_deliver_media,
+                media_delivery_policy=media_policy,
             )
+            if owner is None and self._host_registration_verifier(sys._getframe(1)):
+                self._host_entry_marker(registered)
+            target[name] = registered
+            if media_policy is not None:
+                self._plugin_media_registrations.setdefault(media_policy, []).append(
+                    (scope, name, registered, previous)
+                )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
             # get_toolset_requirements -> TOOLSET_REQUIREMENTS["check_fn"], which
@@ -888,14 +1303,9 @@ class ToolRegistry:
         same toolset.  Used by MCP dynamic tool discovery to nuke-and-repave
         when a server sends ``notifications/tools/list_changed``.
 
-        Gated by the same operator opt-in policy ``register(override=True)``
-        enforces. Without this, a plugin could bypass that gate entirely by
-        deregistering a tool it doesn't own and then calling plain
-        ``register()`` over the now-empty slot — ``register()`` only runs its
-        override check when an ``existing`` entry is present, so removing it
-        first skips the check altogether. MCP toolsets (``mcp-*``) are exempt:
-        dynamic tool discovery legitimately nukes-and-repaves its own tools on
-        every refresh and has no plugin-override concept.
+        Plugin callers are never allowed to deregister registry entries. Plugin
+        lifecycle cleanup uses identity-conditional ``restore_registration``
+        leases instead. Core MCP refresh remains unaffected.
         """
         with self._lock:
             caller_mod = self._caller_module()
@@ -905,6 +1315,11 @@ class ToolRegistry:
                 if caller_owner is not None
                 else None
             )
+            if caller_owner is not None:
+                raise PermissionError(
+                    f"Plugin module {caller_owner!r} cannot deregister a tool "
+                    "through the host registry."
+                )
             target = (
                 self._scoped_tools.get(caller_scope, {})
                 if caller_scope is not None
@@ -921,36 +1336,6 @@ class ToolRegistry:
                 return
             if entry is None:
                 return
-            if not entry.toolset.startswith("mcp-"):
-                owner = self._plugin_owner_of(entry.handler)
-                # Ownership check: bind to the plugin package root
-                # (``hermes_plugins.{name}``), not the exact module string.
-                # A handler defined in ``hermes_plugins.pkg.handlers`` is
-                # still owned by the ``hermes_plugins.pkg`` package — exact
-                # string equality would wrongly block root-module cleanup code
-                # from removing tools registered by a submodule of the same
-                # plugin (egilewski review on #55840).
-                same_plugin = bool(owner and caller_owner == owner)
-                if (
-                    caller_owner is not None
-                    and not same_plugin
-                    and not self._plugin_override_allowed(
-                        caller_scope, caller_owner
-                    )
-                ):
-                    logger.error(
-                        "Tool deregistration REJECTED: plugin %r attempted to "
-                        "remove tool %r (toolset %r) it does not own, without "
-                        "operator opt-in. Set "
-                        "plugins.entries.%s.allow_tool_override: true in "
-                        "config.yaml to allow it.",
-                        caller_mod, name, entry.toolset, caller_mod,
-                    )
-                    raise PermissionError(
-                        f"Plugin module {caller_mod!r} cannot deregister tool "
-                        f"{name!r} (toolset {entry.toolset!r}) without operator "
-                        f"opt-in (allow_tool_override)."
-                    )
             del target[name]
             if caller_scope is not None and not target:
                 self._scoped_tools.pop(caller_scope, None)
@@ -986,6 +1371,12 @@ class ToolRegistry:
         newer entry under the same name, in which case unloading this entry
         must leave the newer entry untouched.
         """
+        if not self._host_caller_verifier(
+            "_ToolRegistrationRestore", "__call__"
+        ):
+            raise PermissionError(
+                "Tool registrations may only be restored by the plugin host lifecycle."
+            )
         with self._lock:
             target = (
                 self._tools

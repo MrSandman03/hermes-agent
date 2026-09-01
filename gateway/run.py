@@ -2007,6 +2007,53 @@ _AUTO_APPEND_MEDIA_TOOL_NAMES = {
     "text_to_speech_tool",
     "image_generate",
 }
+_UNPINNED_MEDIA_ENTRY = object()
+
+
+def _snapshot_auto_delivery_entries() -> Dict[str, Any]:
+    """Pin trusted plugin producer registrations for one gateway turn."""
+    try:
+        from tools.registry import registry
+
+        return {
+            entry.name: entry
+            for entry in registry.get_all_entries()
+            if registry.entry_auto_delivers_media(entry)
+        }
+    except Exception:
+        return {}
+
+
+def _tool_auto_delivers_media(
+    tool_name: str,
+    *,
+    expected_entry: Any = _UNPINNED_MEDIA_ENTRY,
+) -> bool:
+    """Return whether the current registry entry for *tool_name* auto-delivers media.
+
+    A trusted plugin producer is accepted on its own live authority
+    (``entry_auto_delivers_media``), with an identity pin when the caller
+    provides one. Built-in producer names are accepted only while the live
+    entry is still the host-registered one: a plugin override of a built-in
+    name must carry its own gateway.media_delivery authority and is never
+    trusted by name alone.
+    """
+    try:
+        from tools.registry import registry
+
+        entry = registry.get_entry(tool_name)
+    except Exception:
+        return False
+    if entry is None:
+        return False
+    if expected_entry is not _UNPINNED_MEDIA_ENTRY and entry is not expected_entry:
+        return False
+    if registry.entry_auto_delivers_media(entry):
+        return True
+    return (
+        tool_name in _AUTO_APPEND_MEDIA_TOOL_NAMES
+        and registry.entry_is_host_registered(entry)
+    )
 
 # ---- helpers: detect interrupted tool tails & auto-continue noise ----------
 
@@ -2090,6 +2137,7 @@ def _collect_auto_append_media_tags(
     messages: List[Dict[str, Any]],
     history_offset: int = 0,
     history_media_paths: Optional[set] = None,
+    trusted_media_entries: Optional[Dict[str, Any]] = None,
 ) -> tuple[List[str], bool]:
     """Collect real media tags from current-turn producer-tool results only.
 
@@ -2110,6 +2158,8 @@ def _collect_auto_append_media_tags(
     of #160. The producer-tool allowlist still applies on the fallback path.
     """
     history_media_paths = history_media_paths or set()
+    if trusted_media_entries is None:
+        trusted_media_entries = _snapshot_auto_delivery_entries()
     # Only trust the slice boundary when the message list still contains the
     # full history prefix. Otherwise scan everything (compression-safe fallback).
     if history_offset and len(messages) >= history_offset:
@@ -2125,10 +2175,22 @@ def _collect_auto_append_media_tags(
         if msg.get("role") not in ("tool", "function"):
             continue
         call_id = str(msg.get("tool_call_id") or msg.get("call_id") or "")
-        if tool_name_by_call_id.get(call_id) not in _AUTO_APPEND_MEDIA_TOOL_NAMES:
+        tool_name = tool_name_by_call_id.get(call_id, "")
+        expected_entry = trusted_media_entries.get(
+            tool_name,
+            _UNPINNED_MEDIA_ENTRY,
+        )
+        if (
+            tool_name not in _AUTO_APPEND_MEDIA_TOOL_NAMES
+            and expected_entry is _UNPINNED_MEDIA_ENTRY
+        ):
+            continue
+        if not _tool_auto_delivers_media(
+            tool_name,
+            expected_entry=expected_entry,
+        ):
             continue
         content = str(msg.get("content") or "")
-        tool_name = tool_name_by_call_id.get(call_id)
         # JSON-payload tools (image_generate) return a local-file path in a
         # known field rather than a MEDIA: tag. Extract it so delivery is
         # deterministic even when the model omits the path from its reply.
@@ -6635,6 +6697,10 @@ class TurnRunner:
         # from the current turn's extraction. This is compression-safe:
         # even if the message list shrinks, we know which paths are old.
         _history_media_paths: set = _collect_history_media_paths(agent_history)
+        # Pin trusted producer registrations before this turn executes. If a
+        # plugin unloads/reloads while the agent is running, an earlier result
+        # cannot inherit the replacement generation's authority by tool name.
+        _turn_media_entries = _snapshot_auto_delivery_entries()
         
         # Register per-session gateway approval callback so dangerous
         # command approval blocks the agent thread (mirrors CLI input()).
@@ -7220,6 +7286,7 @@ class TurnRunner:
                 result.get("messages", []),
                 history_offset=len(agent_history),
                 history_media_paths=_history_media_paths,
+                trusted_media_entries=_turn_media_entries,
             )
 
             if media_tags:

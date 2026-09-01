@@ -330,18 +330,34 @@ class TestDeferredPlatformToolPreregistration:
         """
         from gateway.platform_registry import platform_registry
         from hermes_cli.plugins import PluginManager
+        from tools.registry import registry
 
         manifest = _write_platform_plugin(tmp_path, "probeplat", with_tools_module=True)
 
         mgr = PluginManager()
         mgr._register_deferred_platform(manifest)
         assert mgr._plugins["probeplat-platform"].tools_registered == ["probeplat_call"]
+        module_name = mgr._policy_module_name(manifest)
+        policy = registry.snapshot_plugin_override_policy(
+            module_name, scope=mgr.scope_key
+        )
+        assert policy is not None
 
         platform_registry.get("probeplat")
 
         loaded = mgr._plugins["probeplat-platform"]
         assert loaded.tools_registered == ["probeplat_call"]
         assert loaded.enabled is True
+        assert (
+            registry.snapshot_plugin_override_policy(
+                module_name, scope=mgr.scope_key
+            )
+            is policy
+        )
+        assert sum(
+            registration.kind == "tool_override_policy"
+            for registration in mgr._ownership_ledger["probeplat-platform"]
+        ) == 1
 
     def test_broken_tools_module_does_not_break_discovery(
         self, tmp_path, probe, clean_registry, caplog

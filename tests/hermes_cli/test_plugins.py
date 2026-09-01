@@ -33,6 +33,7 @@ from hermes_cli.middleware import (
     apply_tool_request_middleware,
     run_tool_execution_middleware,
 )
+from tests.tools.test_registry import _host_registry_call
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -1584,6 +1585,83 @@ class TestThreadToolWhitelist:
 
 class TestPluginContext:
     """Tests for the PluginContext facade."""
+
+    def test_register_tool_preserves_legacy_positional_override(
+        self, monkeypatch
+    ):
+        from hermes_cli.plugins import PluginContext, PluginManifest
+        from tools.registry import ToolRegistry, registry
+
+        name = "legacy_positional_plugin_override"
+        previous = registry.snapshot_registration(name)
+        registry.register(
+            name=name,
+            toolset="base",
+            schema={"name": name, "parameters": {"type": "object", "properties": {}}},
+            handler=lambda *_args, **_kwargs: "base",
+        )
+        base_entry = registry.snapshot_registration(name)
+        manager = PluginManager()
+        manifest = PluginManifest(
+            name="legacy_override_plugin", source="bundled"
+        )
+        context = PluginContext(
+            manager=manager,
+            manifest=manifest,
+        )
+        module_name = manager._policy_module_name(manifest)
+        with _host_registry_call(registry):
+            policy = registry.register_plugin_override_policy(
+                module_name,
+                True,
+                scope=manager.scope_key,
+            )
+        context._tool_policy_namespace = module_name
+        context._tool_policy = policy
+        with _host_registry_call(registry):
+            context._tool_registration_permit = (
+                registry._bind_plugin_registration_context(
+                module_name,
+                policy,
+                scope=manager.scope_key,
+                )
+            )
+        monkeypatch.setattr(context, "_tool_override_allowed", lambda _name: True)
+        monkeypatch.setattr(context, "_assert_privileged_tool_caller", lambda: None)
+        replacement = lambda *_args, **_kwargs: "replacement"
+
+        try:
+            handle = context.register_tool(
+                name,
+                "replacement",
+                {"name": name, "parameters": {"type": "object", "properties": {}}},
+                replacement,
+                None,
+                None,
+                False,
+                "",
+                "",
+                True,
+            )
+
+            entry = registry.get_entry(name)
+            assert handle is not None
+            assert entry is not None
+            assert entry.handler is replacement
+            assert entry.auto_deliver_media is False
+        finally:
+            current = registry.snapshot_registration(name)
+            with _host_registry_call(registry):
+                if current is not None:
+                    registry.restore_registration(name, current, base_entry)
+                if base_entry is not None:
+                    registry.restore_registration(name, base_entry, previous)
+                registry.restore_plugin_override_policy(
+                    module_name,
+                    policy,
+                    None,
+                    scope=manager.scope_key,
+                )
 
 
 

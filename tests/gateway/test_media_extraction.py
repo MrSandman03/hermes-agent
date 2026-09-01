@@ -326,7 +326,6 @@ caption
         assert tags == []
         assert voice is False
 
-
     def test_collect_history_media_paths_includes_image_generate_json(self):
         """Regression for #46627: the history media-path collector must pick up
         image_generate JSON-payload paths (no MEDIA: tag), not just MEDIA:

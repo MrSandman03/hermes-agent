@@ -3,8 +3,11 @@
 import json
 import logging
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from tools.registry import (
     ToolRegistry,
@@ -26,6 +29,26 @@ def _make_schema(name="test_tool"):
         "description": f"A {name}",
         "parameters": {"type": "object", "properties": {}},
     }
+
+
+def _host_register_plugin_policy(registry, *args, **kwargs):
+    with _host_registry_call(registry):
+        return registry.register_plugin_override_policy(*args, **kwargs)
+
+
+def _host_restore_plugin_policy(registry, *args, **kwargs):
+    with _host_registry_call(registry):
+        return registry.restore_plugin_override_policy(*args, **kwargs)
+
+
+@contextmanager
+def _host_registry_call(registry):
+    original = registry.__dict__["_host_caller_verifier"]
+    object.__setattr__(registry, "_host_caller_verifier", lambda *_names: True)
+    try:
+        yield
+    finally:
+        object.__setattr__(registry, "_host_caller_verifier", original)
 
 
 class TestRegisterAndDispatch:
@@ -607,7 +630,7 @@ class TestToolsetAvailabilityAggregation:
 
 
 class TestDeregisterAuthorization:
-    """deregister() must apply the same plugin opt-in gate as register().
+    """deregister() is a core lifecycle operation, never a plugin capability.
 
     A plugin could bypass register(override=True) authorization entirely by
     first calling deregister() to clear the existing entry — making
@@ -626,60 +649,93 @@ class TestDeregisterAuthorization:
         )
         return reg
 
+    @staticmethod
+    def _bound_context(reg, namespace, *, allowed):
+        policy = _host_register_plugin_policy(reg, namespace, allowed)
+        with _host_registry_call(reg):
+            return reg._bind_plugin_registration_context(namespace, policy)
+
     def test_plugin_cannot_deregister_unowned_tool_without_opt_in(self):
         reg = self._reg()
-        reg.register_plugin_override_policy("hermes_plugins.evil", False)
+        _host_register_plugin_policy(reg, "hermes_plugins.evil", False)
         with patch.object(ToolRegistry, "_caller_module", return_value="hermes_plugins.evil"):
-            import pytest
-            with pytest.raises(PermissionError, match="allow_tool_override"):
+            with pytest.raises(PermissionError, match="through the host registry"):
                 reg.deregister("protected")
         assert reg._tools.get("protected") is not None, "tool must survive the rejected deregister"
 
 
-    def test_plugin_root_module_can_deregister_submodule_handler(self):
-        """Plugin root cleaning up a tool whose handler lives in a submodule.
-
-        hermes_plugins.pkg (root cleanup code) must be allowed to deregister a
-        tool whose handler was defined in hermes_plugins.pkg.handlers.  The
-        exact module strings differ, but they share the same plugin package root
-        (hermes_plugins.pkg) — ownership is bound to the package, not the leaf
-        module (egilewski review, #55840).
-        """
+    def test_plugin_root_cannot_deregister_its_submodule_handler(self):
         reg = ToolRegistry()
-        reg.register_plugin_override_policy("hermes_plugins.pkg", False)
+        _host_register_plugin_policy(reg, "hermes_plugins.pkg", False)
         handler = eval("lambda *a, **k: 'sub'", {"__name__": "hermes_plugins.pkg.handlers"})
         reg.register(
             name="sub_tool", toolset="pkg-ts",
             schema={"name": "sub_tool", "description": "", "parameters": {"type": "object", "properties": {}}},
             handler=handler,
         )
-        # Caller is the plugin root (hermes_plugins.pkg), handler is in a
-        # submodule (hermes_plugins.pkg.handlers) — must be allowed.
-        with patch.object(ToolRegistry, "_caller_module", return_value="hermes_plugins.pkg"):
-            reg.deregister("sub_tool")
-        assert reg._tools.get("sub_tool") is None
+        with patch.object(
+            ToolRegistry, "_caller_module", return_value="hermes_plugins.pkg"
+        ):
+            with pytest.raises(PermissionError, match="through the host registry"):
+                reg.deregister("sub_tool")
+        assert reg._tools.get("sub_tool") is not None
 
-    def test_opted_in_plugin_submodule_can_deregister(self):
-        """An opted-in plugin calling deregister() from a submodule must succeed.
-
-        register_plugin_override_policy records the opt-in under the package
-        root (``hermes_plugins.allowed``).  If the caller is a submodule
-        (``hermes_plugins.allowed.cleanup``), the old code looked up
-        ``_plugin_override_policy.get("hermes_plugins.allowed.cleanup")`` →
-        False and wrongly raised PermissionError.  The fix uses caller_root
-        for the policy lookup so submodule callers inherit the package opt-in
-        (egilewski review #2 on #55840).
-        """
+    def test_opted_in_plugin_submodule_cannot_deregister(self):
         reg = ToolRegistry()
         reg.register(
             name="protected", toolset="terminal",
             schema={"name": "protected", "description": "", "parameters": {"type": "object", "properties": {}}},
             handler=lambda *a, **k: "built-in",
         )
-        reg.register_plugin_override_policy("hermes_plugins.allowed", True)
-        with patch.object(ToolRegistry, "_caller_module", return_value="hermes_plugins.allowed.cleanup"):
-            reg.deregister("protected")
-        assert reg._tools.get("protected") is None
+        _host_register_plugin_policy(reg, "hermes_plugins.allowed", True)
+        with patch.object(
+            ToolRegistry,
+            "_caller_module",
+            return_value="hermes_plugins.allowed.cleanup",
+        ):
+            with pytest.raises(PermissionError, match="through the host registry"):
+                reg.deregister("protected")
+        assert reg._tools.get("protected") is not None
+
+    def test_self_minted_policy_cannot_authorize_deregistration(self):
+        reg = self._reg()
+        with patch.object(
+            ToolRegistry,
+            "_caller_module",
+            return_value="hermes_plugins.attacker.tools",
+        ):
+            with pytest.raises(PermissionError, match="plugin host"):
+                reg.register_plugin_override_policy(
+                    "hermes_plugins.attacker", True
+                )
+
+        with patch.object(
+            ToolRegistry,
+            "_caller_module",
+            return_value="hermes_plugins.attacker.tools",
+        ):
+            with pytest.raises(PermissionError, match="through the host registry"):
+                reg.deregister("protected")
+
+        assert reg._tools.get("protected") is not None
+
+    def test_bound_plugin_cannot_use_mcp_toolset_as_override_bypass(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="mcp__protected__read",
+            toolset="mcp-protected",
+            schema=_make_schema("mcp__protected__read"),
+            handler=lambda *_args, **_kwargs: "protected",
+        )
+        _host_register_plugin_policy(reg, "hermes_plugins.attacker", False)
+
+        with patch.object(
+            ToolRegistry, "_caller_module", return_value="hermes_plugins.attacker"
+        ):
+            with pytest.raises(PermissionError, match="through the host registry"):
+                reg.deregister("mcp__protected__read")
+
+        assert reg._tools.get("mcp__protected__read") is not None
 
 
     def test_core_code_deregister_always_allowed(self):
@@ -692,9 +748,8 @@ class TestDeregisterAuthorization:
     def test_full_bypass_blocked(self):
         """The original bypass: deregister then plain register no longer works."""
         reg = self._reg()
-        reg.register_plugin_override_policy("hermes_plugins.evil", False)
+        _host_register_plugin_policy(reg, "hermes_plugins.evil", False)
         with patch.object(ToolRegistry, "_caller_module", return_value="hermes_plugins.evil"):
-            import pytest
             with pytest.raises(PermissionError):
                 reg.deregister("protected")
         # Tool is still present, so a follow-up plain register() hits the
