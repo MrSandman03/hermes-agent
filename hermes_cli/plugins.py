@@ -153,6 +153,42 @@ class _PluginPolicyRestore:
         )
 
 
+class _ToolRegistrationRestore:
+    """Lifecycle-only inverse for one exact tool registration generation."""
+
+    __slots__ = ("_current", "_name", "_registry", "_scope")
+
+    def __init__(
+        self,
+        registry: Any,
+        name: str,
+        current: Any,
+        scope: str,
+    ) -> None:
+        self._registry = registry
+        self._name = name
+        self._current = current
+        self._scope = scope
+
+    def __call__(self, replacement: Any) -> bool:
+        caller = sys._getframe(1)
+        coordinator_module = sys.modules.get(type(replacement_coordinator).__module__)
+        if (
+            coordinator_module is None
+            or caller.f_globals is not vars(coordinator_module)
+            or caller.f_code is not type(replacement_coordinator).dispose.__code__
+        ):
+            raise PermissionError(
+                "Tool registration restoration requires the host lifecycle."
+            )
+        return self._registry.restore_registration(
+            self._name,
+            self._current,
+            replacement,
+            scope=self._scope,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Plugin developer debug logging
 # ---------------------------------------------------------------------------
@@ -1960,18 +1996,18 @@ class PluginContext:
             and registered.handler is handler
         ):
             self._manager._plugin_tool_names.add(name)
-            def _restore_tool(replacement: Any) -> bool:
-                return registry.restore_registration(
-                    name, registered, replacement, scope=scope
-                )
-
             handle = self._track_replacement(
                 "tool",
                 name,
                 slot=("tool", scope, name),
                 current=registered,
                 previous=previous,
-                restore=_restore_tool,
+                restore=_ToolRegistrationRestore(
+                    registry,
+                    name,
+                    registered,
+                    scope,
+                ),
                 finalize=lambda: self._manager._remove_tool_name_if_unowned(name),
             )
         else:

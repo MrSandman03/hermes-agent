@@ -7,7 +7,7 @@ from tests.tools.test_registry import (
     _host_restore_plugin_policy,
     _make_schema,
 )
-from tools.registry import ToolRegistry
+from tools.registry import ToolEntry, ToolRegistry
 
 
 def test_forged_registry_globals_cannot_mint_core_media_authority():
@@ -26,6 +26,96 @@ def test_forged_registry_globals_cannot_mint_core_media_authority():
         )
 
     assert registry.snapshot_registration("forged_core_media") is None
+
+
+def _trusted_media_entry(registry: ToolRegistry, name: str):
+    namespace = f"hermes_plugins.{name}"
+    policy = _host_register_plugin_policy(
+        registry,
+        namespace,
+        False,
+        media_delivery_allowed=True,
+    )
+    with patch.object(ToolRegistry, "_caller_is_plugin_host_method", return_value=True):
+        permit = registry._bind_plugin_registration_context(namespace, policy)
+        registry.register(
+            name=name,
+            toolset="trusted",
+            schema=_make_schema(name),
+            handler=eval(
+                "lambda *_args: 'MEDIA:/tmp/trusted.pdf'",
+                {"__name__": namespace},
+            ),
+            auto_deliver_media=True,
+            _plugin_namespace=namespace,
+            _plugin_policy=policy,
+            _plugin_permit=permit,
+        )
+    entry = registry.snapshot_registration(name)
+    assert entry is not None
+    return policy, entry
+
+
+def test_tool_entries_and_plugin_policies_are_immutable():
+    registry = ToolRegistry()
+    policy, entry = _trusted_media_entry(registry, "immutable_media")
+
+    with pytest.raises(AttributeError, match="ToolEntry registrations are immutable"):
+        entry.handler = lambda *_args: "MEDIA:/tmp/forged.pdf"
+    with pytest.raises(AttributeError, match="ToolEntry registrations are immutable"):
+        entry.auto_deliver_media = False
+    with pytest.raises(AttributeError, match="authorization policies are immutable"):
+        policy.media_delivery_allowed = False
+
+    assert registry.entry_auto_delivers_media(entry) is True
+
+
+def test_direct_restore_cannot_borrow_trusted_media_policy():
+    from tools import registry as registry_mod
+
+    registry = ToolRegistry()
+    registry.register(
+        name="ordinary_tool",
+        toolset="ordinary",
+        schema=_make_schema("ordinary_tool"),
+        handler=lambda *_args: "ordinary",
+    )
+    ordinary = registry.snapshot_registration("ordinary_tool")
+    policy, _trusted = _trusted_media_entry(registry, "trusted_media")
+    assert ordinary is not None
+    forged = ToolEntry(
+        name="ordinary_tool",
+        toolset="ordinary",
+        schema=_make_schema("ordinary_tool"),
+        handler=lambda *_args: "MEDIA:/tmp/unconsented.pdf",
+        check_fn=None,
+        requires_env=[],
+        is_async=False,
+        description="",
+        emoji="",
+        auto_deliver_media=True,
+        media_delivery_policy=policy,
+    )
+
+    with pytest.raises(PermissionError, match="plugin host lifecycle"):
+        registry.restore_registration("ordinary_tool", ordinary, forged)
+    with pytest.raises(PermissionError, match="plugin host lifecycle"):
+        exec(
+            "registry.restore_registration('ordinary_tool', ordinary, forged)",
+            vars(registry_mod),
+            {
+                "registry": registry,
+                "ordinary": ordinary,
+                "forged": forged,
+            },
+        )
+
+    assert registry.snapshot_registration("ordinary_tool") is ordinary
+    assert registry.entry_auto_delivers_media(forged) is False
+
+    object.__setattr__(ordinary, "auto_deliver_media", True)
+    object.__setattr__(ordinary, "_media_delivery_policy", policy)
+    assert registry.entry_auto_delivers_media(ordinary) is False
 
 
 class TestPluginMediaDeliveryAuthorization:

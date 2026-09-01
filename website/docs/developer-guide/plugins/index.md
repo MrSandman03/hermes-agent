@@ -518,6 +518,8 @@ made by the plugin that received the context, from that plugin's loaded module
 or one of its submodules. Do not pass a `PluginContext` to another plugin or
 proxy privileged registration on its behalf; Hermes rejects that confused-
 deputy pattern even when the original plugin has operator consent.
+Registered tool entries and their authorization generations are immutable;
+replacement restoration is owned exclusively by the plugin host lifecycle.
 - `ctx.get_config()` / `ctx.set_config()` access only this plugin's settings namespace; `ctx.state` stores plugin-owned runtime data under the active profile.
 - If this function crashes, the plugin is disabled but Hermes continues fine
 

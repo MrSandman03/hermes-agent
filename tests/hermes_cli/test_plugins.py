@@ -1654,13 +1654,13 @@ class TestPluginContext:
             assert entry.auto_deliver_media is False
         finally:
             current = registry.snapshot_registration(name)
-            if current is not None:
-                registry.restore_registration(name, current, base_entry)
-            if base_entry is not None:
-                registry.restore_registration(name, base_entry, previous)
             with patch.object(
                 ToolRegistry, "_caller_is_plugin_host_method", return_value=True
             ):
+                if current is not None:
+                    registry.restore_registration(name, current, base_entry)
+                if base_entry is not None:
+                    registry.restore_registration(name, base_entry, previous)
                 registry.restore_plugin_override_policy(
                     module_name,
                     policy,
