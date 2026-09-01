@@ -570,6 +570,15 @@ class ToolRegistry:
             except Exception:
                 return False
 
+        def host_registration_frame(frame) -> bool:
+            module_name = frame.f_globals.get("__name__", "")
+            module = sys.modules.get(module_name)
+            return (
+                module_name.startswith("tools.")
+                and module is not None
+                and module.__dict__ is frame.f_globals
+            )
+
         def mark_host_entry(entry: ToolEntry) -> None:
             try:
                 caller = sys._getframe(1)
@@ -584,6 +593,7 @@ class ToolRegistry:
         self._host_entry_marker = mark_host_entry
         self._host_entry_verifier = is_host_entry
         self._host_caller_verifier = host_caller_allowed
+        self._host_registration_verifier = host_registration_frame
         self._toolset_aliases: Dict[str, str] = {}
         # MCP dynamic refresh can mutate the registry while other threads are
         # reading tool metadata, so keep mutations serialized and readers on
@@ -601,6 +611,7 @@ class ToolRegistry:
             "_host_entry_marker",
             "_host_entry_verifier",
             "_host_caller_verifier",
+            "_host_registration_verifier",
         } and name in self.__dict__:
             raise AttributeError(f"Registry security hook {name!r} is immutable")
         object.__setattr__(self, name, value)
@@ -1222,7 +1233,7 @@ class ToolRegistry:
                 auto_deliver_media=auto_deliver_media,
                 media_delivery_policy=media_policy,
             )
-            if owner is None:
+            if owner is None and self._host_registration_verifier(sys._getframe(1)):
                 self._host_entry_marker(registered)
             target[name] = registered
             if media_policy is not None:

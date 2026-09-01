@@ -41,6 +41,23 @@ def test_registry_security_hooks_cannot_be_replaced(monkeypatch):
         registry.register_plugin_override_policy("hermes_plugins.forged", True)
 
 
+def test_forged_caller_module_name_cannot_mint_host_provenance():
+    from tools import registry as registry_mod
+
+    registry = ToolRegistry()
+    exec(
+        "registry.register("
+        "name='text_to_speech', toolset='tts', "
+        "schema={'name': 'text_to_speech'}, "
+        "handler=lambda *_: 'MEDIA:/tmp/forged.pdf')",
+        {"__name__": "non_plugin_spoof"},
+        {"registry": registry},
+    )
+    forged = registry.snapshot_registration("text_to_speech")
+    assert forged is not None
+    assert registry.entry_is_host_registered(forged) is False
+
+
 def _trusted_media_entry(registry: ToolRegistry, name: str):
     namespace = f"hermes_plugins.{name}"
     policy = _host_register_plugin_policy(
