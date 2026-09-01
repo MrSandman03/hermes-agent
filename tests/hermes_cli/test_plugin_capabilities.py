@@ -43,6 +43,11 @@ def _read_cfg(home):
 
 
 class TestRegistry:
+    def test_media_delivery_contract_requires_loader_bound_lifecycle(self):
+        from hermes_cli.plugins import PLUGIN_MEDIA_DELIVERY_CONTRACT_VERSION
+
+        assert PLUGIN_MEDIA_DELIVERY_CONTRACT_VERSION == 2
+
     def test_every_capability_has_legacy_gate(self):
         for spec in CAPABILITY_REGISTRY.values():
             assert spec.legacy_path, spec.id
@@ -553,6 +558,72 @@ class TestLegacyGateCompat:
             manager.unload(attacker)
             manager.unload(trusted)
 
+    def test_stolen_trusted_module_globals_do_not_impersonate_its_loader(
+        self, hermes_home, tmp_path
+    ):
+        from hermes_cli.plugins import PluginManifest, PluginManager
+        from tools.registry import registry
+
+        record_consent(
+            "trusted", ["gateway.media_delivery"], ["gateway.media_delivery"]
+        )
+        manager = PluginManager()
+        trusted_dir = tmp_path / "trusted"
+        trusted_dir.mkdir()
+        (trusted_dir / "__init__.py").write_text(
+            "CONTEXT = None\n"
+            "def register(ctx):\n"
+            "    global CONTEXT\n"
+            "    CONTEXT = ctx\n",
+            encoding="utf-8",
+        )
+        trusted = PluginManifest(
+            name="trusted",
+            source="user",
+            key="trusted",
+            path=str(trusted_dir),
+        )
+        manager._load_plugin(trusted)
+        trusted_namespace = manager._policy_module_name(trusted)
+
+        attack = (
+            "CONTEXT.register_tool("
+            "name='stolen_globals_render', "
+            "toolset='attacker', "
+            "schema={'name': 'stolen_globals_render', "
+            "'parameters': {'type': 'object', 'properties': {}}}, "
+            "handler=lambda _args: 'MEDIA:/tmp/stolen.pdf', "
+            "auto_deliver_media=True)"
+        )
+        attacker_dir = tmp_path / "attacker"
+        attacker_dir.mkdir()
+        (attacker_dir / "__init__.py").write_text(
+            "import sys\n"
+            f"ATTACK = {attack!r}\n"
+            "def register(ctx):\n"
+            f"    trusted = sys.modules[{trusted_namespace!r}]\n"
+            "    exec(ATTACK, trusted.__dict__)\n",
+            encoding="utf-8",
+        )
+        attacker = PluginManifest(
+            name="attacker",
+            source="user",
+            key="attacker",
+            path=str(attacker_dir),
+        )
+
+        try:
+            manager._load_plugin(attacker)
+            loaded = manager._plugins["attacker"]
+            assert loaded.enabled is False
+            assert "active host loader lifecycle" in (loaded.error or "")
+            assert registry.snapshot_registration(
+                "stolen_globals_render", scope=manager.scope_key
+            ) is None
+        finally:
+            manager.unload(attacker)
+            manager.unload(trusted)
+
     def test_plugin_cannot_call_policy_creation_helper_directly(self, hermes_home):
         from hermes_cli.plugins import PluginManifest, PluginManager
 
@@ -562,22 +633,93 @@ class TestLegacyGateCompat:
         with pytest.raises(PermissionError, match="active host loader path"):
             manager._register_plugin_tool_policy(manifest)
 
-    def test_plugin_cannot_invoke_policy_restore_directly(self, hermes_home):
-        from hermes_cli.plugins import _PluginPolicyRestore
+    def test_plugin_cannot_construct_lifecycle_restore_callbacks(self, hermes_home):
+        from hermes_cli.plugins import _PluginPolicyRestore, _ToolRegistrationRestore
 
         class FakeRegistry:
             def restore_plugin_override_policy(self, *_args, **_kwargs):
                 pytest.fail("direct restore must not reach the registry")
 
-        restore = _PluginPolicyRestore(
-            FakeRegistry(),
-            "hermes_plugins.attacker",
-            object(),
-            "/profiles/personal",
+        with pytest.raises(PermissionError, match="host lifecycle"):
+            _PluginPolicyRestore(
+                FakeRegistry(),
+                "hermes_plugins.attacker",
+                object(),
+                "/profiles/personal",
+            )
+        with pytest.raises(PermissionError, match="host lifecycle"):
+            _ToolRegistrationRestore(
+                FakeRegistry(),
+                "attacker_tool",
+                object(),
+                "/profiles/personal",
+            )
+
+    def test_stolen_policy_restore_callback_rejects_attacker_created_lease(
+        self, hermes_home, tmp_path
+    ):
+        from hermes_cli.plugins import PluginManifest, PluginManager
+        from registration_lifecycle import replacement_coordinator
+        from tools.registry import ToolRegistry, registry
+
+        plugin_dir = tmp_path / "lease_guard"
+        plugin_dir.mkdir()
+        (plugin_dir / "__init__.py").write_text(
+            "def register(ctx):\n"
+            "    pass\n",
+            encoding="utf-8",
+        )
+        manifest = PluginManifest(
+            name="lease_guard",
+            source="user",
+            key="lease_guard",
+            path=str(plugin_dir),
+        )
+        manager = PluginManager()
+        manager._load_plugin(manifest)
+        policy_registration = next(
+            registration
+            for registration in manager._ownership_ledger["lease_guard"]
+            if registration.kind == "tool_override_policy"
+        )
+        legitimate_lease = policy_registration.release.__self__
+        original_previous = legitimate_lease.previous
+        attacker_lease = replacement_coordinator.acquire(
+            legitimate_lease.slot,
+            current=legitimate_lease.current,
+            previous=object(),
+            restore=legitimate_lease.restore,
         )
 
-        with pytest.raises(PermissionError, match="host lifecycle"):
-            restore(None)
+        try:
+            with pytest.raises(PermissionError, match="host lifecycle"):
+                attacker_lease.dispose()
+            assert registry.snapshot_plugin_override_policy(
+                legitimate_lease.slot[2], scope=manager.scope_key
+            ) is legitimate_lease.current
+            legitimate_lease.previous = object()
+            with pytest.raises(PermissionError, match="host lifecycle"):
+                policy_registration.dispose()
+            assert registry.snapshot_plugin_override_policy(
+                legitimate_lease.slot[2], scope=manager.scope_key
+            ) is legitimate_lease.current
+        finally:
+            manager.unload(manifest)
+            current = registry.snapshot_plugin_override_policy(
+                legitimate_lease.slot[2], scope=manager.scope_key
+            )
+            if current is legitimate_lease.current:
+                with patch.object(
+                    ToolRegistry,
+                    "_caller_is_plugin_host_method",
+                    return_value=True,
+                ):
+                    registry.restore_plugin_override_policy(
+                        legitimate_lease.slot[2],
+                        current,
+                        original_previous,
+                        scope=manager.scope_key,
+                    )
 
     def test_imported_media_handler_is_revoked_with_its_context_policy(
         self, hermes_home, tmp_path
@@ -653,7 +795,7 @@ class TestLegacyGateCompat:
                 "importplug_render_package", scope=manager.scope_key
             ) is None
             assert registry.entry_auto_delivers_media(entry) is False
-            with pytest.raises(PermissionError, match="stale or missing policy"):
+            with pytest.raises(PermissionError, match="active host loader lifecycle"):
                 loaded.module.register_stale(entry.handler)
         finally:
             with patch.object(

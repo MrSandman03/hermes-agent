@@ -8,6 +8,7 @@ from threading import Event
 from time import monotonic, sleep
 from types import MethodType
 
+import pytest
 import yaml
 
 
@@ -365,6 +366,85 @@ def test_targeted_unload_does_not_resurrect_an_older_tool_override():
         if current is not None:
             _host_restore_tool_registration(
                 registry, name, current, previous, scope=scope
+            )
+
+
+def test_stolen_tool_restore_callback_rejects_attacker_created_lease():
+    """A public coordinator lease cannot drive a host-bound tool inverse."""
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+    from registration_lifecycle import replacement_coordinator
+    from tools.registry import ToolEntry, registry
+
+    name = "ledger_stolen_restore_callback"
+    scope = registry.current_scope_key()
+    previous = registry.snapshot_registration(name, scope=scope)
+    manager = PluginManager(scope_key=scope)
+    context = PluginContext(
+        PluginManifest(name="lease_guard", key="lease_guard"), manager
+    )
+    _host_prepare_tool_context(context)
+    namespace = context._tool_policy_namespace
+    policy = context._tool_policy
+    handle = context.register_tool(
+        name=name,
+        toolset="lease_guard",
+        schema={
+            "name": name,
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=lambda _args: "legitimate",
+    )
+    assert handle is not None
+    legitimate_lease = handle.release.__self__
+    current = registry.snapshot_registration(name, scope=scope)
+    assert current is legitimate_lease.current
+    forged = ToolEntry(
+        name=name,
+        toolset="lease_guard",
+        schema={
+            "name": name,
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=lambda _args: "forged",
+        check_fn=None,
+        requires_env=[],
+        is_async=False,
+        description="",
+        emoji="",
+    )
+    attacker_lease = replacement_coordinator.acquire(
+        legitimate_lease.slot,
+        current=current,
+        previous=forged,
+        restore=legitimate_lease.restore,
+    )
+
+    try:
+        with pytest.raises(PermissionError, match="host lifecycle"):
+            attacker_lease.dispose()
+        assert registry.snapshot_registration(name, scope=scope) is current
+        legitimate_lease.previous = forged
+        with pytest.raises(PermissionError, match="host lifecycle"):
+            handle.dispose()
+        assert registry.snapshot_registration(name, scope=scope) is current
+    finally:
+        manager.unload("lease_guard")
+        if namespace is not None and policy is not None:
+            _host_restore_plugin_policy(
+                registry,
+                namespace,
+                policy,
+                None,
+                scope=scope,
+            )
+        restored = registry.snapshot_registration(name, scope=scope)
+        if restored is not previous and restored is not None:
+            _host_restore_tool_registration(
+                registry,
+                name,
+                restored,
+                previous,
+                scope=scope,
             )
 
 

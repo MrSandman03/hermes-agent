@@ -109,7 +109,82 @@ logger = logging.getLogger(__name__)
 # Installers may probe this source-level contract before enabling a plugin that
 # uses ``register_tool(auto_deliver_media=True)``. Increment for incompatible
 # registration or enforcement changes.
-PLUGIN_MEDIA_DELIVERY_CONTRACT_VERSION = 1
+PLUGIN_MEDIA_DELIVERY_CONTRACT_VERSION = 2
+
+
+_REPLACEMENT_DISPOSE_CODE = type(replacement_coordinator).dispose.__code__
+_REPLACEMENT_COORDINATOR_GLOBALS = vars(
+    sys.modules[type(replacement_coordinator).__module__]
+)
+
+
+def _caller_is_exact_plugin_host_method(
+    owner_name: str,
+    *method_names: str,
+) -> bool:
+    """Require an exact host method code object, including wrapped methods."""
+    try:
+        caller = sys._getframe(2)
+        module = sys.modules[__name__]
+        if caller.f_globals is not vars(module):
+            return False
+        owner = getattr(module, owner_name)
+        for method_name in method_names:
+            method = getattr(owner, method_name)
+            while method is not None:
+                if caller.f_code is method.__code__:
+                    return True
+                method = getattr(method, "__wrapped__", None)
+    except Exception:
+        return False
+    return False
+
+
+def _snapshot_replacement_lineage(lease: Any) -> tuple[Any, tuple[tuple, ...]]:
+    """Freeze the predecessor identities a host-created lease may restore."""
+    previous = lease.previous
+    predecessors = []
+    seen = set()
+    predecessor = lease.predecessor
+    while predecessor is not None:
+        if id(predecessor) in seen:
+            raise PermissionError("Replacement lifecycle contains a cycle.")
+        seen.add(id(predecessor))
+        predecessors.append(
+            (
+                predecessor,
+                predecessor.current,
+                predecessor.previous,
+                predecessor.predecessor,
+            )
+        )
+        predecessor = predecessor.predecessor
+    return previous, tuple(predecessors)
+
+
+def _replacement_matches_bound_lineage(
+    lease: Any,
+    previous: Any,
+    predecessors: tuple[tuple, ...],
+    replacement: Any,
+) -> bool:
+    """Validate coordinator output against the immutable bound lease lineage."""
+    first_predecessor = predecessors[0][0] if predecessors else None
+    if lease.previous is not previous or lease.predecessor is not first_predecessor:
+        return False
+    expected = previous
+    for predecessor, current, prior, next_predecessor in predecessors:
+        if (
+            predecessor.current is not current
+            or predecessor.previous is not prior
+            or predecessor.predecessor is not next_predecessor
+        ):
+            return False
+        if predecessor.active:
+            expected = current
+            break
+        expected = prior
+    return replacement is expected
 
 
 class _PluginPolicyRestore:
@@ -120,7 +195,15 @@ class _PluginPolicyRestore:
     confused deputy by supplying policy objects directly.
     """
 
-    __slots__ = ("_current", "_module_name", "_registry", "_scope")
+    __slots__ = (
+        "_current",
+        "_lease",
+        "_module_name",
+        "_predecessors",
+        "_previous",
+        "_registry",
+        "_scope",
+    )
 
     def __init__(
         self,
@@ -129,18 +212,55 @@ class _PluginPolicyRestore:
         current: Any,
         scope: str,
     ) -> None:
+        if not _caller_is_exact_plugin_host_method(
+            "PluginManager", "_register_plugin_tool_policy"
+        ):
+            raise PermissionError(
+                "Plugin tool policy restoration requires the host lifecycle."
+            )
         self._registry = registry
         self._module_name = module_name
         self._current = current
         self._scope = scope
+        self._lease: Any = None
+        self._previous: Any = None
+        self._predecessors: tuple[tuple, ...] = ()
+
+    def _bind_lifecycle_lease(self, lease: Any) -> None:
+        if not _caller_is_exact_plugin_host_method(
+            "PluginManager", "_register_plugin_tool_policy"
+        ):
+            raise PermissionError(
+                "Plugin tool policy restoration requires the host lifecycle."
+            )
+        if self._lease is not None:
+            raise PermissionError("Plugin tool policy restoration is already bound.")
+        if (
+            lease.coordinator is not replacement_coordinator
+            or lease.restore is not self
+            or lease.current is not self._current
+            or lease.slot
+            != ("tool_override_policy", self._scope, self._module_name)
+        ):
+            raise PermissionError("Plugin tool policy restoration lease is invalid.")
+        self._previous, self._predecessors = _snapshot_replacement_lineage(lease)
+        self._lease = lease
 
     def __call__(self, replacement: Any) -> bool:
         caller = sys._getframe(1)
-        coordinator_module = sys.modules.get(type(replacement_coordinator).__module__)
+        lease = self._lease
         if (
-            coordinator_module is None
-            or caller.f_globals is not vars(coordinator_module)
-            or caller.f_code is not type(replacement_coordinator).dispose.__code__
+            lease is None
+            or caller.f_globals is not _REPLACEMENT_COORDINATOR_GLOBALS
+            or caller.f_code is not _REPLACEMENT_DISPOSE_CODE
+            or caller.f_locals.get("lease") is not lease
+            or lease.restore is not self
+            or not _replacement_matches_bound_lineage(
+                lease,
+                self._previous,
+                self._predecessors,
+                replacement,
+            )
         ):
             raise PermissionError(
                 "Plugin tool policy restoration requires the host lifecycle."
@@ -156,7 +276,15 @@ class _PluginPolicyRestore:
 class _ToolRegistrationRestore:
     """Lifecycle-only inverse for one exact tool registration generation."""
 
-    __slots__ = ("_current", "_name", "_registry", "_scope")
+    __slots__ = (
+        "_current",
+        "_lease",
+        "_name",
+        "_predecessors",
+        "_previous",
+        "_registry",
+        "_scope",
+    )
 
     def __init__(
         self,
@@ -165,18 +293,52 @@ class _ToolRegistrationRestore:
         current: Any,
         scope: str,
     ) -> None:
+        if not _caller_is_exact_plugin_host_method("PluginContext", "register_tool"):
+            raise PermissionError(
+                "Tool registration restoration requires the host lifecycle."
+            )
         self._registry = registry
         self._name = name
         self._current = current
         self._scope = scope
+        self._lease: Any = None
+        self._previous: Any = None
+        self._predecessors: tuple[tuple, ...] = ()
+
+    def _bind_lifecycle_lease(self, lease: Any) -> None:
+        if not _caller_is_exact_plugin_host_method(
+            "PluginContext", "_track_replacement"
+        ):
+            raise PermissionError(
+                "Tool registration restoration requires the host lifecycle."
+            )
+        if self._lease is not None:
+            raise PermissionError("Tool registration restoration is already bound.")
+        if (
+            lease.coordinator is not replacement_coordinator
+            or lease.restore is not self
+            or lease.current is not self._current
+            or lease.slot != ("tool", self._scope, self._name)
+        ):
+            raise PermissionError("Tool registration restoration lease is invalid.")
+        self._previous, self._predecessors = _snapshot_replacement_lineage(lease)
+        self._lease = lease
 
     def __call__(self, replacement: Any) -> bool:
         caller = sys._getframe(1)
-        coordinator_module = sys.modules.get(type(replacement_coordinator).__module__)
+        lease = self._lease
         if (
-            coordinator_module is None
-            or caller.f_globals is not vars(coordinator_module)
-            or caller.f_code is not type(replacement_coordinator).dispose.__code__
+            lease is None
+            or caller.f_globals is not _REPLACEMENT_COORDINATOR_GLOBALS
+            or caller.f_code is not _REPLACEMENT_DISPOSE_CODE
+            or caller.f_locals.get("lease") is not lease
+            or lease.restore is not self
+            or not _replacement_matches_bound_lineage(
+                lease,
+                self._previous,
+                self._predecessors,
+                replacement,
+            )
         ):
             raise PermissionError(
                 "Tool registration restoration requires the host lifecycle."
@@ -1724,6 +1886,8 @@ class PluginContext:
             restore=restore,
             finalize=finalize,
         )
+        if isinstance(restore, _ToolRegistrationRestore):
+            restore._bind_lifecycle_lease(lease)
         return self._track(kind, key, lease.dispose)
 
     # -- host-owned LLM access ----------------------------------------------
@@ -1864,7 +2028,7 @@ class PluginContext:
     # -- tool registration --------------------------------------------------
 
     def _assert_privileged_tool_caller(self) -> None:
-        """Bind privileged registration to this plugin's real loaded module."""
+        """Bind privileged registration to this plugin's active host loader."""
         namespace = self._tool_policy_namespace
         if not namespace:
             raise PermissionError(
@@ -1888,12 +2052,46 @@ class PluginContext:
                     or module_name.startswith(f"{namespace}.")
                 )
             )
+            loader_frame = frame
+            valid_loader = False
+            loader_globals = globals()
+            load_code = type(self._manager)._load_plugin_scoped.__code__
+            deferred_code = (
+                type(self._manager)._register_deferred_platform_tools.__code__
+            )
+            while loader_frame is not None:
+                if loader_frame.f_globals is loader_globals:
+                    if loader_frame.f_code is load_code:
+                        loaded_module = loader_frame.f_locals.get("module")
+                        valid_loader = bool(
+                            loader_frame.f_locals.get("ctx") is self
+                            and isinstance(loaded_module, types.ModuleType)
+                            and (
+                                loaded_module.__name__ == namespace
+                                or loaded_module.__name__.startswith(f"{namespace}.")
+                            )
+                        )
+                    elif loader_frame.f_code is deferred_code:
+                        tools_module = loader_frame.f_locals.get("tools_module")
+                        valid_loader = bool(
+                            loader_frame.f_locals.get("tool_context") is self
+                            and isinstance(tools_module, types.ModuleType)
+                            and (
+                                tools_module.__name__ == namespace
+                                or tools_module.__name__.startswith(f"{namespace}.")
+                            )
+                        )
+                    if valid_loader:
+                        break
+                loader_frame = loader_frame.f_back
         except Exception:
             valid_module = False
-        if not valid_module:
+            valid_loader = False
+        if not valid_module or not valid_loader:
             raise PermissionError(
                 f"Plugin {self.plugin_id!r} may perform privileged tool "
-                "registration only from its own loaded module."
+                "registration only from its own loaded module during its "
+                "active host loader lifecycle."
             )
 
     @_serialized_replacement
@@ -5652,17 +5850,19 @@ class PluginManager:
                 ),
                 scope=self.scope_key,
             )
+            policy_restore = _PluginPolicyRestore(
+                registry,
+                module_name,
+                current_policy,
+                self.scope_key,
+            )
             policy_lease = replacement_coordinator.acquire(
                 ("tool_override_policy", self.scope_key, module_name),
                 current=current_policy,
                 previous=previous_policy,
-                restore=_PluginPolicyRestore(
-                    registry,
-                    module_name,
-                    current_policy,
-                    self.scope_key,
-                ),
+                restore=policy_restore,
             )
+            policy_restore._bind_lifecycle_lease(policy_lease)
             self._track_registration(
                 manifest,
                 "tool_override_policy",
